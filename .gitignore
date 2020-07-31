@@ -1,0 +1,9 @@
+*.swp
+*.o
+*.so
+*.a 
+rdptest*
+
+core
+
+.vscode
