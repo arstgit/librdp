@@ -1979,3 +1979,15 @@ rdpConn *rdpNetConnect(rdpSocket *s, const char *host, const char *service) {
 
   return (rp == NULL) ? NULL : c;
 }
+
+int rdpConnGetAddr(rdpConn *c, struct sockaddr *addr, socklen_t *addrlen) {
+  if (!c) {
+    return -1;
+  }
+
+  *addr = *(struct sockaddr *)&c->addr;
+
+  *addrlen = c->addrlen;
+
+  return 0;
+}

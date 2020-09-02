@@ -42,6 +42,7 @@ ssize_t rdpWrite(rdpConn *c, const void *buf, size_t len);
 ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **c,
                     int *flag);
 int rdpSocketIntervalAction(rdpSocket *s);
+int rdpConnGetAddr(rdpConn *c, struct sockaddr *addr, socklen_t *addrlen);
 int rdpSocketGetProp(rdpSocket *s, int opt);
 int rdpSocketSetProp(rdpSocket *s, int opt, int val);
 void *rdpConnGetUserData(rdpConn *c);

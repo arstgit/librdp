@@ -22,6 +22,19 @@
 rdpSocket *ctx1, *ctx2;
 rdpConn *conn1, *conn2;
 
+char *rdpAddressStr(const struct sockaddr *addr, socklen_t addrlen,
+                    char *addrStr, int addrStrLen) {
+  char host[NI_MAXHOST], service[NI_MAXSERV];
+
+  if (getnameinfo(addr, addrlen, host, NI_MAXHOST, service, NI_MAXSERV,
+                  NI_NUMERICSERV) == 0)
+    snprintf(addrStr, addrStrLen, "(%s, %s)", host, service);
+  else
+    snprintf(addrStr, addrStrLen, "(?UNKNOWN?)");
+
+  return addrStr;
+}
+
 int processIn(int fd) {
   int readCount;
   int events;
@@ -66,6 +79,16 @@ int processIn(int fd) {
 
       if (events & RDP_ACCEPT) {
         printf("ctx2 accept\n");
+        struct sockaddr_storage addr;
+        socklen_t len;
+        char info[1024];
+
+        rdpConnGetAddr(newConn, (struct sockaddr *)&addr, &len);
+
+        rdpAddressStr((struct sockaddr *)&addr, len, info, 1024);
+
+        printf("accept from addr: %s\n", info);
+
         ssize_t n;
         n = rdpWrite(newConn, "test3.", 6);
       }
@@ -98,12 +121,12 @@ int main() {
   int n, i;
   int cnt1;
 
-  ctx1 = rdpSocketCreate(1, "localhost", "8888");
+  ctx1 = rdpSocketCreate(1, "127.0.0.1", "8888");
   assert(ctx1);
-  ctx2 = rdpSocketCreate(1, "localhost", "8889");
+  ctx2 = rdpSocketCreate(1, "127.0.0.1", "8889");
   assert(ctx2);
 
-  conn1 = rdpNetConnect(ctx1, "localhost", "8889");
+  conn1 = rdpNetConnect(ctx1, "127.0.0.1", "8889");
   assert(conn1);
 
   efd = epoll_create1(0);
@@ -163,17 +186,4 @@ int main() {
 exit:
   rdpSocketDestroy(ctx1);
   rdpSocketDestroy(ctx2);
-}
-
-char *rdpAddressStr(const struct sockaddr *addr, socklen_t addrlen,
-                    char *addrStr, int addrStrLen) {
-  char host[NI_MAXHOST], service[NI_MAXSERV];
-
-  if (getnameinfo(addr, addrlen, host, NI_MAXHOST, service, NI_MAXSERV,
-                  NI_NUMERICSERV) == 0)
-    snprintf(addrStr, addrStrLen, "(%s, %s)", host, service);
-  else
-    snprintf(addrStr, addrStrLen, "(?UNKNOWN?)");
-
-  return addrStr;
 }

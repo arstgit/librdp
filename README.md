@@ -1,6 +1,6 @@
 # librtp
 
-Reliable datagram protocol.
+Reliable datagram protocol. More aggressive bandwidth usage.
 
 
 ## Prerequisites
