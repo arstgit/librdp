@@ -23,6 +23,12 @@ rdpSocket *ctx = rdpSocketCreate(1, "127.0.0.1", "8888");
 // Establish a connection.
 rdpConn *conn = rdpNetConnect(ctx, "www.example.com", "8889");
 
+// Some user data can be attached to rdpConn.
+// It's the same for the rdpConn generated from accept connection.
+void * userData = NULL;
+rdpConnSetUserData(conn, userData);
+assert(rdpConnGetUserData(c) == userData);
+
 int efd = epoll_create1(0);
 
 // This is the fd rdpSocketCreate() opened.
@@ -86,13 +92,19 @@ for (;;) {
           //
           // Corresponding rdpConn can be fetched through newConn here.
 
-          // rdpConnClose() must be invoked explicitly at some point after
-          // usage.
+          struct sockaddr_storage addr;
+          socklen_t len;
+          // Fetch the address of the other end.
+          rdpConnGetAddr(newConn, (struct sockaddr *)&addr, &len);
+
+          // rdpConnClose() must be invoked explicitly somewhere after
+          // usage. 
+          // If the arrived connection is not expected, invoke rdpConnClose() immediately here.
           printf("new connection arrived.");
         }
 
         if (events & RDP_CONNECTED) {
-          // rdpNetConnect() succeeded.
+          // Previous rdpNetConnect() succeeded.
           //
           // Corresponding rdpConn can be fetched through newConn here.
 
