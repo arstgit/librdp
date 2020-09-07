@@ -138,6 +138,8 @@ int main() {
   fd2 = rdpSocketGetProp(ctx2, RDP_PROP_FD);
   assert(fd2);
 
+  memset(&ev, 0, sizeof(ev));
+
   ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
   ev.data.fd = fd1;
   n = epoll_ctl(efd, EPOLL_CTL_ADD, fd1, &ev);

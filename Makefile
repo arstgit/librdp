@@ -1,6 +1,6 @@
 CC=gcc
 
-DEPS = rdp.h liblist/list.h
+DEPS = rdp.h libdict/dict.h libdict/crc.h
 OBJS = $(patsubst %.h,%.o,$(DEPS))
 
 BUILD = release

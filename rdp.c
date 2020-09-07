@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "liblist/list.h"
+#include "libdict/dict.h"
 
 #include "rdp.h"
 
@@ -149,7 +149,8 @@ struct packetWrap {
 
 struct rdpSocket {
   void *userData;          // User data variable.
-  list *conns;             // Record rdpConns.
+  dict *conns;             // Record rdpConns.
+  dictIterator *connsIter; // Iterator of the conns dict.
   uint64_t mstime;         // Updated before used, in milliseconds.
   uint64_t lastCheck;      // Updated after every invoke on rdpConnCheck(), in
                            // milliseconds.
@@ -457,56 +458,55 @@ static void tlog(rdpSocket *rdpSocket, int level, const char *fmt, ...) {
 }
 #endif
 
-// List node deletion callback.
-static void listFreeRdpConn(void *value) {
-  rdpConn *c = (rdpConn *)value;
+// See dict.h.
+uint64_t rdpConnHashCallback(const void *key) {
+  rdpConn *c = (rdpConn *)key;
+
+  return dictHashFnDefault((unsigned char *)&c->recvId, 1);
+}
+
+// Dict node deletion callback.
+void rdpConnDestructor(void *val) {
+  rdpConn *c = (rdpConn *)val;
 
   rbufferFree(&c->inbuf);
   rbufferFree(&c->outbuf);
 
-  free(value);
+  free(val);
 }
 
-// List node compare callback.
+// rdpConn node compare callback.
 // Using three fields of rdpConn: recvId, addr, addrlen to determine
 // equlity.
 // Return 1 if equal, otherwise 0.
-static int listEqualRdpConn(void *value, void *comparedValue) {
-  rdpConn *currentV, *comparedV;
+int rdpConnCmp(const void *key1, const void *key2) {
+  rdpConn *c1, *c2;
 
-  currentV = (rdpConn *)value;
-  comparedV = (rdpConn *)comparedValue;
+  c1 = (rdpConn *)key1;
+  c2 = (rdpConn *)key2;
 
-  if (currentV->recvId != comparedV->recvId)
+  if (c1->recvId != c2->recvId)
     return 0;
 
-  if (currentV->addrlen != comparedV->addrlen)
+  if (c1->addrlen != c2->addrlen)
     return 0;
 
-  if (memcmp(&currentV->addr, &comparedV->addr, currentV->addrlen) != 0)
-    return 0;
-
-  return 1;
+  return memcmp(&c1->addr, &c2->addr, c1->addrlen) == 0;
 }
 
 // Just Invoke listNodeDestroy() is enough, actions free internal struct is
 // registerd in list.
-static void rdpConnDestroy(rdpConn *c) {
+static int rdpConnDestroy(rdpConn *c) {
   // Not registered in rdpSocket->conns.
   if (!(c->addrlen || c->idSeed)) {
-    listFreeRdpConn((void *)c);
-    return;
+    rdpConnDestructor((void *)c);
+    return 0;
   }
 
-  rdpSocket *s;
-  listNode *node;
+  dictEntry *e = dictEntryDelete(c->rdpSocket->conns, c, 0);
 
-  s = c->rdpSocket;
-  node = listNodeFind(s->conns, c);
-
-  assert(node);
-
-  listNodeDestroy(s->conns, node);
+  assert(e);
+  return 0;
 }
 
 // Create a UDP socket, bound to address "node:service".
@@ -577,10 +577,13 @@ rdpSocket *rdpSocketCreate(int version, const char *node, const char *service) {
     exit(EXIT_FAILURE);
   }
 
-  s->conns = listCreate();
+  dictType rdpConnDictType = {rdpConnHashCallback, rdpConnCmp, NULL, NULL,
+                              rdpConnDestructor,   NULL};
+  s->conns = dictCreate(&rdpConnDictType);
   assert(s->conns);
-  listMethodSetFree(s->conns, &listFreeRdpConn);
-  listMethodSetEqual(s->conns, &listEqualRdpConn);
+
+  s->connsIter = dictIteratorCreate(s->conns);
+  assert(s->connsIter);
 
   s->mstime = mstime();
   s->lastCheck = s->mstime;
@@ -595,37 +598,48 @@ rdpSocket *rdpSocketCreate(int version, const char *node, const char *service) {
 }
 
 // Close fd, free conns list.
-int rdpSocketDestroy(rdpSocket *rdpSocket) {
-  if (!rdpSocket)
+int rdpSocketDestroy(rdpSocket *s) {
+  if (!s)
     return -1;
 
-  close(rdpSocket->fd);
+  close(s->fd);
 
-  listDestroy(rdpSocket->conns);
+  if (dictDestroy(s->conns) == -1) {
+    assert(0);
+  }
 
-  free(rdpSocket);
+  if (dictIteratorDestroy(s->connsIter) == -1) {
+    assert(0);
+  }
+
+  free(s);
 
   return 0;
 }
 
 // Make a fake rdpConn to compare.
-static listNode *findRdpConnInRdpSocket(rdpSocket *s,
-                                        const struct sockaddr *addr,
-                                        socklen_t addrlen, uint16_t recvId) {
+static rdpConn *findRdpConnInRdpSocket(rdpSocket *s,
+                                       const struct sockaddr *addr,
+                                       socklen_t addrlen, uint16_t recvId) {
   rdpConn comparedValue;
 
   memcpy(&comparedValue.addr, addr, addrlen);
   comparedValue.addrlen = addrlen;
   comparedValue.recvId = recvId;
 
-  return listNodeFind(s->conns, &comparedValue);
+  dictEntry *e = dictFind(s->conns, &comparedValue);
+
+  if (e) {
+    return (rdpConn *)dictKeyGet(e);
+  }
+  return NULL;
 }
 
 // Initialize rdpConn, attatch itself to rdpSocket->conns.
 // Shouldn't be invoked directly.
-void rdpConnInit(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen,
-                 int generateSeed, uint16_t idSeed, uint16_t recvId,
-                 uint16_t sendId) {
+int rdpConnInit(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen,
+                int generateSeed, uint16_t idSeed, uint16_t recvId,
+                uint16_t sendId) {
   if (generateSeed) {
     do {
       idSeed = rand() & 0xffff;
@@ -644,14 +658,10 @@ void rdpConnInit(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen,
   c->lastReceivedPacket = c->rdpSocket->mstime;
 
   // Attach this socket to context->rdpConns list.
-  listNode *node = listNodeAddHead(c->rdpSocket->conns, c);
-  if (node == NULL) {
-#ifdef RDP_DEBUG
-    tlog(c->rdpSocket, LL_DEBUG, "listNodeAddHead");
-#endif
+  int n = dictAdd(c->rdpSocket->conns, c, NULL);
+  assert(n == 0);
 
-    exit(EXIT_FAILURE);
-  }
+  return 0;
 }
 
 // Create a rdpConn.
@@ -916,20 +926,24 @@ static ssize_t sendAck(rdpConn *c) {
 }
 
 // Send ack packets on all rdpConns if needed.
-static void rdpContextAck(rdpSocket *s) {
+static int rdpContextAck(rdpSocket *s) {
   if (!s)
-    return;
+    return -1;
 
-  listIterator *iter = listIteratorCreate(s->conns, LIST_START_HEAD);
-  listNode *node;
+  dictEntry *e;
   rdpConn *c;
-  while (node = listIteratorNext(iter)) {
-    c = (rdpConn *)node->value;
+  while (e = dictIteratorNext(s->connsIter)) {
+    c = (rdpConn *)dictKeyGet(e);
 
     if (c->needSendAck) {
       sendAck(c);
     }
   }
+  if (dictIteratorRewind(s->connsIter) != 0) {
+    assert(0);
+  }
+
+  return 0;
 }
 
 // Return -1 if connection is full.
@@ -1293,12 +1307,10 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
   ssize_t rawRead;
   uint inbufPrefix;
 
-  listNode *node;
-  listIterator *iter = listIteratorCreate(s->conns, LIST_START_HEAD);
-
+  dictEntry *e;
   // Drain ordered buffer on each connection.
-  while (node = listIteratorNext(iter)) {
-    *conn = (rdpConn *)node->value;
+  while (e = dictIteratorNext(s->connsIter)) {
+    *conn = (rdpConn *)dictKeyGet(e);
 
     if ((*conn)->state != CS_CONNECTED && (*conn)->state != CS_CONNECTED_FULL) {
       continue;
@@ -1319,6 +1331,10 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       tlog(s, LL_DEBUG, "receivedFinCompleted");
 #endif
 
+      if (dictIteratorRewind(s->connsIter) != 0) {
+        assert(0);
+      }
+
       // EOF
       return 0;
     }
@@ -1337,6 +1353,11 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 #ifdef RDP_DEBUG
         tlog(s, LL_NOTICE, "user supplied len is not enough.");
 #endif
+
+        if (dictIteratorRewind(s->connsIter) != 0) {
+          assert(0);
+        }
+
         return -1;
       }
 
@@ -1353,9 +1374,15 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     assert((*conn)->outOfOrderCnt > 0);
     (*conn)->outOfOrderCnt--;
 
+    if (dictIteratorRewind(s->connsIter) != 0) {
+      assert(0);
+    }
+
     return inbufPrefix > 0 ? inbufPrefix : -1;
   }
-  listIteratorDestroy(iter);
+  if (dictIteratorRewind(s->connsIter) != 0) {
+    assert(0);
+  }
   *conn = NULL;
 
   // Read from socket only after drained ordered buffer in queue.
@@ -1390,16 +1417,14 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
   s->mstime = mstime();
 
   if (type == ST_SYN) {
-    node = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
-                                  connId + 1);
-    if (node) {
-      *conn = (rdpConn *)node->value;
-
+    *conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
+                                   connId + 1);
+    if (*conn) {
       if ((*conn)->state != CS_SYN_RECV) {
         return -1;
       }
     } else {
-      if (listLengthGet(s->conns) > RDP_MAX_CONNS_PER_RDPSOCKET) {
+      if (dictFilled(s->conns) > RDP_MAX_CONNS_PER_RDPSOCKET) {
         *events = RDP_ERROR;
         return -1;
       }
@@ -1421,12 +1446,11 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
     return -1;
   } else if (type == ST_STATE || type == ST_DATA || type == ST_FIN) {
-    node = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
-                                  connId);
-    if (!node)
+    *conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
+                                   connId);
+    if (!*conn)
       return -1;
 
-    *conn = (rdpConn *)node->value;
     rdpConn *c = *conn;
 
     if (c->state == CS_DESTROY) {
@@ -1915,18 +1939,19 @@ int rdpSocketIntervalAction(rdpSocket *s) {
   s->lastCheck = s->mstime;
   s->nextCheckTimeout = RDP_SOCKET_CHECK_TIMEOUT_DEFAULT;
 
-  listIterator *iter = listIteratorCreate(s->conns, LIST_START_HEAD);
-  listNode *node;
+  dictEntry *e;
   rdpConn *c;
-  while (node = listIteratorNext(iter)) {
-    c = (rdpConn *)node->value;
+  while (e = dictIteratorNext(s->connsIter)) {
+    c = (rdpConn *)dictKeyGet(e);
     rdpConnCheck(c);
 
     if (c->state == CS_DESTROY) {
       rdpConnDestroy(c);
     }
   }
-  listIteratorDestroy(iter);
+  if (dictIteratorRewind(s->connsIter) != 0) {
+    assert(0);
+  }
 
   return s->nextCheckTimeout;
 }

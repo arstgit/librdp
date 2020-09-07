@@ -1,3 +1,3 @@
-[submodule "liblist"]
-	path = liblist
-	url = https://github.com/derekchuank/liblist
+[submodule "libdict"]
+	path = libdict
+	url = https://github.com/derekchuank/libdict
