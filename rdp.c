@@ -865,14 +865,13 @@ static ssize_t sendAck(rdpConn *c) {
   if (c->outOfOrderCnt != 0 && c->state != CS_SYN_RECV &&
       !c->receivedFinCompleted) {
 
-    // sackSize must be a multiple of 4, and at least 4.
-    int sackSize =
+    // sackByteSize must be a multiple of 4, and at least 4.
+    int sackByteSize =
         c->outOfOrderCnt / 8 + 1 + 3 - ((c->outOfOrderCnt / 8 + 1 + 3) % 4);
 
-    packetLen = getPacketWithSAckHeaderSize() - 1 + sackSize;
+    packetLen = getPacketWithSAckHeaderSize() - 1 + sackByteSize;
     p = (struct packet *)malloc(packetLen);
     assert(p);
-    memset(p, 0, packetLen);
     struct packetWithSAck *ps = (struct packetWithSAck *)p;
 
     // Out of order state check.
@@ -881,25 +880,29 @@ static ssize_t sendAck(rdpConn *c) {
 
     ps->p.reserve = 1;
     ps->next = 0;
-    ps->len = sackSize;
+    ps->len = sackByteSize;
 
     // buf's size equals buf's mask plus 1.
     // The slot of s->acknr + 1 is always empty.
-    size_t len = min(sackSize * 8, c->inbuf.mask);
+    size_t len = min(sackByteSize * 8, c->inbuf.mask);
 
-    for (int group = 0; group < (sackSize / 4) && len > 0; len -= 32, group++) {
+    for (int group32 = 0; group32 < (sackByteSize / 4); group32++) {
       uint32_t m = 0;
 
-      for (size_t i = 0; i < min(32, len); i++) {
-        if (rbufferGet(&c->inbuf, c->acknr + i + 2 + group * 32) != NULL) {
-          m |= 1 << i;
+      if (len > 0) {
+        for (size_t i = 0; i < min(32, len); i++) {
+          if (rbufferGet(&c->inbuf, c->acknr + i + 2 + group32 * 32) != NULL) {
+            m |= 1 << i;
+          }
         }
       }
 
-      ((uint8_t *)ps->mask)[0 + group * 4] = (uint8_t)m;
-      ((uint8_t *)ps->mask)[1 + group * 4] = (uint8_t)(m >> 8);
-      ((uint8_t *)ps->mask)[2 + group * 4] = (uint8_t)(m >> 16);
-      ((uint8_t *)ps->mask)[3 + group * 4] = (uint8_t)(m >> 24);
+      ((uint8_t *)ps->mask)[0 + group32 * 4] = (uint8_t)m;
+      ((uint8_t *)ps->mask)[1 + group32 * 4] = (uint8_t)(m >> 8);
+      ((uint8_t *)ps->mask)[2 + group32 * 4] = (uint8_t)(m >> 16);
+      ((uint8_t *)ps->mask)[3 + group32 * 4] = (uint8_t)(m >> 24);
+
+      len -= 32;
     }
   } else {
     packetLen = getPacketHeaderSize();
@@ -1224,46 +1227,51 @@ int selectiveAck(rdpConn *c, uint32_t startSeqnr, const uint8_t *mask,
                  uint8_t len) {
   int offset = len * 8 - 1;
 
-#ifdef RDP_DEBUG_2
-  char bitmask[4096] = {0};
-  int counter = offset;
-  for (int i = 0; i <= offset; ++i) {
-    uint8_t b = counter >= 0 && mask[counter >> 3] & (1 << (counter & 7));
-    bitmask[i] = b ? '1' : '0';
-    --counter;
-  }
-
-  tlog(c->rdpSocket, LL_DEBUG | LL_RAW, "sack bits:\n%s\n", bitmask,
-       startSeqnr);
-#endif
-
   do {
-    uint v = startSeqnr + offset;
+    uint16_t curSeqnr = startSeqnr + offset;
 
-    if (((c->seqnr - v - 1) & RDP_ACK_NR_MASK) >= (uint16_t)(c->queue - 1))
+    if (((c->seqnr - curSeqnr - 1) & RDP_ACK_NR_MASK) >=
+        (uint16_t)(c->queue - 1))
       continue;
 
-    uint8_t b = offset >= 0 && mask[offset >> 3] & (1 << (offset & 7));
+    int b = mask[offset >> 3] & (1 << (offset & 7));
+    if (!b)
+      continue;
 
-    struct packetWrap *pw = (struct packetWrap *)rbufferGet(&c->outbuf, v);
+    struct packetWrap *pw =
+        (struct packetWrap *)rbufferGet(&c->outbuf, curSeqnr);
     if (!pw) {
       continue;
     }
 
     if (pw->transmissions == 0) {
+
+#ifdef RDP_DEBUG
+      char bitmask[4096] = {0};
+      int counter = offset;
+      for (int i = 0; i <= offset; ++i) {
+        uint8_t b = counter >= 0 && mask[counter >> 3] & (1 << (counter & 7));
+        bitmask[i] = b ? '1' : '0';
+        --counter;
+      }
+
+      tlog(c->rdpSocket, LL_DEBUG | LL_RAW, "sack bits:\n%s\n", bitmask,
+           startSeqnr);
+
+      tlog(c->rdpSocket, LL_DEBUG, "startSeqnr: %u, len: %d", startSeqnr, len);
+#endif
+
       assert(0);
       continue;
     }
 
-    if (b) {
-      assert((v & c->outbuf.mask) != ((c->seqnr - c->queue) & c->outbuf.mask));
+    assert((curSeqnr & c->outbuf.mask) !=
+           ((c->seqnr - c->queue) & c->outbuf.mask));
 
-      ackPacket(c, v);
+    ackPacket(c, curSeqnr);
 
-      continue;
-    }
-
-  } while (--offset >= -1);
+    continue;
+  } while (--offset >= 0);
 
   return 0;
 }
