@@ -876,7 +876,8 @@ static ssize_t sendAck(rdpConn *c) {
     struct packetWithSAck *ps = (struct packetWithSAck *)p;
 
     // Out of order state check.
-    assert(!rbufferGet(&c->inbuf, c->acknr + 1));
+    // If rdpConnClose() was invoked, this invariance might not sustain.
+    assert(c->state == CS_FIN_SENT || !rbufferGet(&c->inbuf, c->acknr + 1));
 
     ps->p.reserve = 1;
     ps->next = 0;
@@ -1192,17 +1193,17 @@ int rdpConnClose(rdpConn *c) {
       return 0;
     }
 
-    // Send ack before send fin packet if required.
-    if (c->needSendAck) {
-      sendAck(c);
-    }
-
     // One slot is reserved for ST_FIN, see rdpWriteVec().
     assert(c->queue < RDP_QUEUE_SIZE_MAX);
     buildSendPacket(c, 0, ST_FIN, NULL, 0);
     rdpConnFlushPackets(c);
 
     c->state = CS_FIN_SENT;
+
+    // Send ack before send fin packet if required.
+    if (c->needSendAck) {
+      sendAck(c);
+    }
 
     return 0;
   case CS_SYN_SENT:
@@ -1643,6 +1644,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
       return payload == 0 ? -1 : payload;
     } else {
+      // seqCnt != 0
       if (c->receivedFin && pseqnr > c->eofseqnr) {
 
 #ifdef RDP_DEBUG
@@ -1669,7 +1671,6 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       *(uint *)packetWithPrefix = (uint)payload;
       memcpy(packetWithPrefix + sizeof(uint), payloadStart, payload);
 
-      assert(rbufferGet(&c->inbuf, pseqnr) == NULL);
       assert((pseqnr & c->inbuf.mask) != ((c->acknr + 1) & c->inbuf.mask));
 
       rbufferPut(&c->inbuf, pseqnr, packetWithPrefix);
