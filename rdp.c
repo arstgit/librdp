@@ -1351,11 +1351,12 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     if ((*conn)->outOfOrderCnt == 0)
       continue;
 
-    uint8_t *p = (uint8_t *)rbufferGet(&(*conn)->inbuf, (*conn)->acknr + 1);
-    if (p == NULL)
+    uint8_t *packetWithPrefix =
+        (uint8_t *)rbufferGet(&(*conn)->inbuf, (*conn)->acknr + 1);
+    if (packetWithPrefix == NULL)
       continue;
 
-    inbufPrefix = *(uint *)p;
+    inbufPrefix = *(uint *)packetWithPrefix;
     if (inbufPrefix > 0) {
       if (inbufPrefix > len) {
         *events = RDP_ERROR;
@@ -1370,13 +1371,13 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
         return -1;
       }
 
-      memcpy(buf, p + sizeof(uint), inbufPrefix);
+      memcpy(buf, packetWithPrefix + sizeof(uint), inbufPrefix);
 
       *events = RDP_DATA;
     }
 
     rbufferPut(&(*conn)->inbuf, (*conn)->acknr + 1, NULL);
-    free(p);
+    free(packetWithPrefix);
     (*conn)->acknr++;
     (*conn)->needSendAck = 1;
 
@@ -1573,6 +1574,10 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     }
 
     while (c->queue > 0 && !rbufferGet(&c->outbuf, c->seqnr - c->queue)) {
+#ifdef RDP_DEBUG
+      tlog(c->rdpSocket, LL_DEBUG, "queue: %d, seqnr: %d, buf mask: %d",
+           c->queue, c->seqnr, c->outbuf.mask);
+#endif
       // Something is wrong.
       assert(0);
     }
@@ -1674,7 +1679,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
         return -1;
       }
 
-      uint8_t *packetWithPrefix = (uint8_t *)malloc((payload) + sizeof(uint));
+      uint8_t *packetWithPrefix = (uint8_t *)malloc(payload + sizeof(uint));
       assert(packetWithPrefix);
       *(uint *)packetWithPrefix = (uint)payload;
       memcpy(packetWithPrefix + sizeof(uint), payloadStart, payload);
