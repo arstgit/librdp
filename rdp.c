@@ -864,6 +864,9 @@ static ssize_t sendAck(rdpConn *c) {
 
   if (c->outOfOrderCnt != 0 && c->state != CS_SYN_RECV &&
       !c->receivedFinCompleted) {
+    // Out of order state check.
+    // If rdpConnClose() was invoked, this invariance might not sustain.
+    assert(c->state != CS_FIN_SENT);
 
     // sackByteSize must be a multiple of 4, and at least 4.
     int sackByteSize =
@@ -873,10 +876,6 @@ static ssize_t sendAck(rdpConn *c) {
     p = (struct packet *)malloc(packetLen);
     assert(p);
     struct packetWithSAck *ps = (struct packetWithSAck *)p;
-
-    // Out of order state check.
-    // If rdpConnClose() was invoked, this invariance might not sustain.
-    assert(c->state == CS_FIN_SENT || !rbufferGet(&c->inbuf, c->acknr + 1));
 
     ps->p.reserve = 1;
     ps->next = 0;
@@ -1203,11 +1202,6 @@ int rdpConnClose(rdpConn *c) {
 
     c->state = CS_FIN_SENT;
 
-    // Send ack before send fin packet if required.
-    if (c->needSendAck) {
-      sendAck(c);
-    }
-
     return 0;
   case CS_SYN_SENT:
     c->state = CS_DESTROY;
@@ -1330,9 +1324,9 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
         (*conn)->eofseqnr == (*conn)->acknr) {
       (*conn)->receivedFinCompleted = 1;
 
-      sendAck(*conn);
+      assert((*conn)->outOfOrderCnt == 0);
 
-      (*conn)->outOfOrderCnt = 0;
+      sendAck(*conn);
 
       *events = RDP_DATA;
 
@@ -1376,13 +1370,13 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       *events = RDP_DATA;
     }
 
-    rbufferPut(&(*conn)->inbuf, (*conn)->acknr + 1, NULL);
     free(packetWithPrefix);
     (*conn)->acknr++;
+    rbufferPut(&(*conn)->inbuf, (*conn)->acknr, NULL);
     (*conn)->needSendAck = 1;
 
-    assert((*conn)->outOfOrderCnt > 0);
     (*conn)->outOfOrderCnt--;
+    assert((*conn)->outOfOrderCnt >= 0);
 
     if (dictIteratorRewind(s->connsIter) != 0) {
       assert(0);
@@ -1574,12 +1568,9 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     }
 
     while (c->queue > 0 && !rbufferGet(&c->outbuf, c->seqnr - c->queue)) {
-#ifdef RDP_DEBUG
-      tlog(c->rdpSocket, LL_DEBUG, "queue: %d, seqnr: %d, buf mask: %d",
-           c->queue, c->seqnr, c->outbuf.mask);
-#endif
-      // Something is wrong.
-      assert(0);
+      assert(!sackMask);
+
+      c->queue--;
     }
 
     if (c->queue > 0 && sackMask) {
@@ -1629,13 +1620,13 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       }
     }
 
-    if (c->state == CS_FIN_SENT) {
+    if (c->state != CS_CONNECTED && c->state != CS_CONNECTED_FULL) {
       return -1;
     }
 
     // Right next packet expected.
     if (seqCnt == 0) {
-      if (payload > 0 && c->state != CS_FIN_SENT) {
+      if (payload > 0) {
 
         // Exceeded supplied buffer length.
         if (payload > len) {

@@ -125,7 +125,6 @@ int main() {
   assert(ctx1);
   ctx2 = rdpSocketCreate(1, "127.0.0.1", "8889");
   assert(ctx2);
-
   conn1 = rdpNetConnect(ctx1, "127.0.0.1", "8889");
   assert(conn1);
 
