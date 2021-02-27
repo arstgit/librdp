@@ -928,6 +928,30 @@ static ssize_t sendAck(rdpConn *c) {
   return n;
 }
 
+// Send an ack packet.
+static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
+                         socklen_t addrlen) {
+  size_t packetLen;
+  struct packet *p;
+  int n;
+
+  packetLen = getPacketHeaderSize();
+  p = (struct packet *)malloc(packetLen);
+  assert(p);
+  memset(p, 0, packetLen);
+
+  p->reserve = 0;
+
+  packetSetVersion(p, 1);
+  packetSetType(p, ST_RESET);
+
+  n = sendto(fd, p, packetLen, 0, dest_addr, addrlen);
+
+  free(p);
+
+  return n;
+}
+
 // Send ack packets on all rdpConns if needed.
 static int rdpContextAck(rdpSocket *s) {
   if (!s)
@@ -1449,15 +1473,28 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     sendAck(*conn);
 
     return -1;
-  } else if (type == ST_STATE || type == ST_DATA || type == ST_FIN) {
+  } else if (type == ST_STATE || type == ST_DATA || type == ST_FIN ||
+             type == ST_RESET) {
     *conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
                                    connId);
-    if (!*conn)
+    if (!*conn) {
+      // Unknown packet. Send reset packet.
+
+      sendReset(s->fd, (const struct sockaddr *)&addr, addrlen);
+
       return -1;
+    }
 
     rdpConn *c = *conn;
 
     if (c->state == CS_DESTROY) {
+      return -1;
+    }
+
+    if (type == ST_RESET) {
+      c->state = CS_DESTROY;
+
+      *events = RDP_ERROR;
       return -1;
     }
 
