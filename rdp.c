@@ -808,8 +808,8 @@ static int rdpConnFlightWindowFull(rdpConn *c) {
       (uint32_t)min(c->flightWindowLimit, c->recvWindowPeer)) {
 #ifdef RDP_DEBUG
     tlog(c->rdpSocket, LL_DEBUG,
-         "connection is full, flightWindow: %d, limit: %d", c->flightWindow,
-         c->flightWindowLimit);
+         "connection is full, flightWindow: %d, limit: %d, recvWindowPeer: %d",
+         c->flightWindow, c->flightWindowLimit, c->recvWindowPeer);
 #endif
     return 1;
   }
@@ -930,7 +930,7 @@ static ssize_t sendAck(rdpConn *c) {
 
 // Send an ack packet.
 static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
-                         socklen_t addrlen) {
+                         socklen_t addrlen, uint16_t connId) {
   size_t packetLen;
   struct packet *p;
   int n;
@@ -941,6 +941,7 @@ static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
   memset(p, 0, packetLen);
 
   p->reserve = 0;
+  p->connId = connId;
 
   packetSetVersion(p, 1);
   packetSetType(p, ST_RESET);
@@ -980,8 +981,9 @@ static int rdpConnFlushPackets(rdpConn *c) {
     if (pw == NULL || (pw->transmissions > 0 && pw->needResend == 0))
       continue;
 
-    if (rdpConnFlightWindowFull(c))
+    if (rdpConnFlightWindowFull(c)) {
       return -1;
+    }
 
     sendPacketWrap(c, pw);
   }
@@ -1478,9 +1480,18 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     *conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
                                    connId);
     if (!*conn) {
-      // Unknown packet. Send reset packet.
+      // Unknown packet.
+      if (type != ST_RESET) {
 
-      sendReset(s->fd, (const struct sockaddr *)&addr, addrlen);
+#ifdef RDP_DEBUG
+        tlog(s, LL_DEBUG, "received unknown packet, send ST_RESET, connId: %d",
+             connId);
+#endif
+
+        sendReset(s->fd, (const struct sockaddr *)&addr, addrlen, connId);
+      } else {
+        // Silently ignore unknown ST_RESET packet received.
+      }
 
       return -1;
     }
@@ -1493,6 +1504,11 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
     if (type == ST_RESET) {
       c->state = CS_DESTROY;
+
+#ifdef RDP_DEBUG
+      tlog(s, LL_DEBUG, "received ST_RESET, destroy connection, connId: %d",
+           connId);
+#endif
 
       *events = RDP_ERROR;
       return -1;
