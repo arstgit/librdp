@@ -20,6 +20,16 @@
 
 #include "rdp.h"
 
+#ifdef RDP_DEBUG
+
+#define ttlog(...) tlog(__VA_ARGS__)
+
+#else
+
+#define ttlog(...) ((void)(0))
+
+#endif
+
 // Queue size is the capacity of the ring buffer, in elements.
 // Set it to 16 * 1024 cause of the number of selective ack bits is limited to
 // the max UDP payload 1390(bytes) * 8(bits) = 11120(bits).
@@ -76,8 +86,7 @@
 // #define UDP_IPV4_MTU                                                           \
   (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE -       \
    PPPOE_HEADER_SIZE - MPPE_HEADER_SIZE - FUDGE_HEADER_SIZE)
-#define UDP_IPV4_MTU                                                           \
-  (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE)
+#define UDP_IPV4_MTU (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE)
 #define UDP_IPV6_MTU                                                           \
   (ETHERNET_MTU - IPV6_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE -       \
    PPPOE_HEADER_SIZE - MPPE_HEADER_SIZE - FUDGE_HEADER_SIZE)
@@ -97,13 +106,17 @@
 // CS_SYN_RECV.
 
 enum connState {
-  CS_UNINITIALIZED = 0,
+  CS_UNINITIALIZED = 0, // User shouldn't get a connection handle in this state.
   CS_SYN_SENT,
-  CS_SYN_RECV,
+  CS_SYN_RECV, // User shouldn't get a connection handle in this state.
   CS_CONNECTED,
   CS_CONNECTED_FULL,
-  CS_FIN_SENT,
-  CS_DESTROY
+  CS_FIN_SENT, // Only the invocation of rdpConnClose() can trigger this.
+  CS_RESET, // Connection get a ST_RESET packet, change it's state to CS_RESET
+            // not CS_DESTORY for getting user a chance to be notified and do
+            // some sweep job. Once received ST_RESET packet, it's user's job to
+            // change it to CS_DESTROY by invoking rdpConnClose().
+  CS_DESTROY // Should be set only after the invocation of rdpConnClose().
 };
 
 #ifdef RDP_DEBUG
@@ -191,12 +204,14 @@ struct rdpConn {
   uint32_t recvWindowSelf; // This is our receive window.
   int32_t oldestResent;
   uint16_t idSeed;
-  uint16_t recvId;
-  uint16_t sendId;
+  // On the connection initial end, sendId = recvId + 1, the other end, sendId =
+  // recvId - 1.
+  uint16_t recvId; // Used for identify received packets' connection id.
+  uint16_t sendId; // Set the connection id field when sending packets.
   uint16_t queue;
   uint16_t outOfOrderCnt;
   uint16_t seqnr;
-  uint16_t acknr;
+  uint16_t acknr; // Record the packets we have sent to user on this connection.
   uint16_t eofseqnr;
   uint8_t receivedFinCompleted : 1;
   uint8_t receivedFin : 1;
@@ -599,7 +614,7 @@ rdpSocket *rdpSocketCreate(int version, const char *node, const char *service) {
   return s;
 }
 
-// Close fd, free conns list.
+// Close fd, free conns dict.
 int rdpSocketDestroy(rdpSocket *s) {
   if (!s)
     return -1;
@@ -868,6 +883,7 @@ static ssize_t sendAck(rdpConn *c) {
       !c->receivedFinCompleted) {
     // Out of order state check.
     // If rdpConnClose() was invoked, this invariance might not sustain.
+
     assert(c->state != CS_FIN_SENT);
 
     // sackByteSize must be a multiple of 4, and at least 4.
@@ -930,7 +946,7 @@ static ssize_t sendAck(rdpConn *c) {
   return n;
 }
 
-// Send an ack packet.
+// ST_RESET packet's connection id should be the sendId of the other end.
 static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
                          socklen_t addrlen, uint16_t connId) {
   size_t packetLen;
@@ -959,6 +975,10 @@ static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
 static int rdpContextAck(rdpSocket *s) {
   if (!s)
     return -1;
+
+#ifdef RDP_DEBUG
+  tlog(s, LL_DEBUG, "rdpContextAck");
+#endif
 
   dictEntry *e;
   rdpConn *c;
@@ -1190,7 +1210,8 @@ ssize_t rdpWrite(rdpConn *c, const void *buf, size_t len) {
   return rdpWriteVec(c, &vec, 1);
 }
 
-// Change rdpConn state, invoke rdpConnDestroy() in rdpIntervalAction() later.
+// Change rdpConn state accordingly, the actual free is done by rdpConnDestroy()
+// in rdpIntervalAction() later.
 int rdpConnClose(rdpConn *c) {
   if (!c) {
     errno = EINVAL;
@@ -1199,12 +1220,16 @@ int rdpConnClose(rdpConn *c) {
 
   switch (c->state) {
   case CS_UNINITIALIZED:
+  // Haven't return the connection the user, can't be called here.
   case CS_SYN_RECV:
+  // Haven't return the connection the user, can't be called here.
   case CS_DESTROY:
+  // todo after received ST_RESET, call this function.
   case CS_FIN_SENT:
+    // Already called this function.
 #ifdef RDP_DEBUG
     tlog(c->rdpSocket, LL_DEBUG, "not expected conn state. errInfo: %s",
-         c->errInfo);
+         connStateNames[c->state]);
 #endif
     errno = EINVAL;
     return -1;
@@ -1217,7 +1242,7 @@ int rdpConnClose(rdpConn *c) {
 
 #ifdef RDP_DEBUG
       tlog(c->rdpSocket, LL_DEBUG,
-           "change state to CS_DESTROY, passive close receivedFinCompleted.");
+           "change state to CS_DESTROY, passive close receivedFin.");
 #endif
 
       return 0;
@@ -1237,6 +1262,9 @@ int rdpConnClose(rdpConn *c) {
     tlog(c->rdpSocket, LL_DEBUG,
          "change state to CS_DESTROY, invoked rdpConnClose() on CS_SYN_SENT.");
 #endif
+    return 0;
+  case CS_RESET:
+    c->state = CS_DESTROY;
     return 0;
   default:
     assert(0);
@@ -1339,7 +1367,9 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
   uint inbufPrefix;
 
   dictEntry *e;
-  // Drain ordered buffer on each connection.
+
+  // Check every connection, see if there is any data we can send to user based
+  // on the connection acknr. Drain it if there is.
   while (e = dictIteratorNext(s->connsIter)) {
     *conn = (rdpConn *)dictKeyGet(e);
 
@@ -1350,21 +1380,22 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     // receivedFin and eofseqnr are related fields.
     if (!(*conn)->receivedFinCompleted && (*conn)->receivedFin &&
         (*conn)->eofseqnr == (*conn)->acknr) {
+      // Received all packets the other end sent.
       (*conn)->receivedFinCompleted = 1;
 
       assert((*conn)->outOfOrderCnt == 0);
 
-      sendAck(*conn);
-
-      *events = RDP_DATA;
-
 #ifdef RDP_DEBUG
-      tlog(s, LL_DEBUG, "receivedFinCompleted");
+      tlog(s, LL_DEBUG, "receivedFinCompleted, sendAck");
 #endif
+
+      sendAck(*conn);
 
       if (dictIteratorRewind(s->connsIter) != 0) {
         assert(0);
       }
+
+      *events = RDP_DATA;
 
       // EOF
       return 0;
@@ -1373,11 +1404,16 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     if ((*conn)->outOfOrderCnt == 0)
       continue;
 
+    // We have some out of order packet in buffer, send the right next packet if
+    // there is.
     uint8_t *packetWithPrefix =
         (uint8_t *)rbufferGet(&(*conn)->inbuf, (*conn)->acknr + 1);
-    if (packetWithPrefix == NULL)
+    if (packetWithPrefix == NULL) {
+      // Don't have buffer to send.
       continue;
+    }
 
+    // Get the payload size of the packet to be returned to user.
     inbufPrefix = *(uint *)packetWithPrefix;
     if (inbufPrefix > 0) {
       if (inbufPrefix > len) {
@@ -1401,9 +1437,12 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     free(packetWithPrefix);
     (*conn)->acknr++;
     rbufferPut(&(*conn)->inbuf, (*conn)->acknr, NULL);
+
     (*conn)->needSendAck = 1;
 
     (*conn)->outOfOrderCnt--;
+
+    // Still have out of order packet in buffer.
     assert((*conn)->outOfOrderCnt >= 0);
 
     if (dictIteratorRewind(s->connsIter) != 0) {
@@ -1426,6 +1465,10 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       rdpContextAck(s);
     } else {
       *events = RDP_ERROR;
+
+#ifdef RDP_DEBUG
+      tlog(s, LL_DEBUG, "recvfrom error");
+#endif
     }
 
     return -1;
@@ -1474,6 +1517,10 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     (*conn)->retransmitTicker =
         (*conn)->rdpSocket->mstime + (*conn)->retransmitTimeout;
 
+#ifdef RDP_DEBUG
+    tlog(s, LL_DEBUG, "get a syn, sendack");
+#endif
+
     sendAck(*conn);
 
     return -1;
@@ -1481,9 +1528,11 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
              type == ST_RESET) {
     *conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
                                    connId);
+
     if (!*conn) {
-      // Unknown packet.
       if (type != ST_RESET) {
+        // Unindentified packet, send back a ST_RESET packet with the original
+        // connection id, aka, the sender's sendId.
 
 #ifdef RDP_DEBUG
         tlog(s, LL_DEBUG, "received unknown packet, send ST_RESET, connId: %d",
@@ -1492,7 +1541,71 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
         sendReset(s->fd, (const struct sockaddr *)&addr, addrlen, connId);
       } else {
-        // Silently ignore unknown ST_RESET packet received.
+        // Got a ST_RESET, it's connection id should equal our sendId.
+        // sendId is either 1 more than recvId, otherwise 1 less.
+        if (((*conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr,
+                                             addrlen, connId + 1)) &&
+             ((*conn)->sendId == connId)) ||
+            ((*conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr,
+                                             addrlen, connId - 1)) &&
+             ((*conn)->sendId == connId))) {
+#ifdef RDP_DEBUG
+          tlog(s, LL_DEBUG,
+               "received ST_RESET, destroy connection, recvId: %d, sendId: %d",
+               (*conn)->recvId, (*conn)->sendId);
+#endif
+
+          switch ((*conn)->state) {
+          case CS_UNINITIALIZED:
+            // Haven't reached outside world. Corrupted packet maybe.
+          case CS_SYN_RECV:
+            // User haven't got this connection handle, don't need to be
+            // notified.
+          case CS_FIN_SENT:
+            // User have already invoked rdpConnClose(), shouldn't be notified.
+            (*conn)->state = CS_DESTROY;
+            break;
+          case CS_SYN_SENT:
+          case CS_CONNECTED_FULL:
+          case CS_CONNECTED:
+            // User have got this connection handle, should be notified to do
+            // some sweep jobs.
+
+            (*conn)->state = CS_RESET;
+            *events = RDP_CONN_ERROR;
+            break;
+          case CS_RESET:
+          case CS_DESTROY:
+            break;
+          default:
+            assert(0);
+          }
+
+          if ((*conn)->state != CS_DESTROY && (*conn)->state != CS_RESET) {
+            if ((*conn)->state != CS_FIN_SENT) {
+              // Conncetion state indicate user haven't called rdpConnClose, he
+              // got the chance to call it.
+#ifdef RDP_DEBUG
+              tlog((*conn)->rdpSocket, LL_DEBUG, "RDP_CONN_EROR, state: %s",
+                   connStateNames[(*conn)->state]);
+#endif
+              *events = RDP_CONN_ERROR;
+              (*conn)->state = CS_RESET;
+            } else {
+              // User has already called rdpConnClose(), don't report this to
+              // him.
+
+              (*conn)->state = CS_DESTROY;
+            }
+
+            // todo place here?
+            (*conn)->needSendAck = 0;
+          }
+
+        } else {
+          // state is CS_DESTROY or CS_RESET already, don't need to report to
+          // user. Silently ignore unknown packets.
+        }
       }
 
       return -1;
@@ -1500,19 +1613,23 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
     rdpConn *c = *conn;
 
-    if (c->state == CS_DESTROY) {
+    if (c->state == CS_RESET) {
+      // Packet's connection id shouldn't match this connection. Packet must be
+      // corrupted.
+#ifdef RDP_DEBUG
+      tlog(s, LL_DEBUG, "received %s, already in CS_RESET, connId: %d",
+           packetStateNames[type], connId);
+#endif
+
       return -1;
     }
 
-    if (type == ST_RESET) {
-      c->state = CS_DESTROY;
-
+    if (c->state == CS_DESTROY) {
 #ifdef RDP_DEBUG
-      tlog(s, LL_DEBUG, "received ST_RESET, destroy connection, connId: %d",
-           connId);
+      tlog(s, LL_DEBUG, "received %s, already in CS_DESTROY, connId: %d",
+           packetStateNames[type], connId);
 #endif
 
-      *events = RDP_ERROR;
       return -1;
     }
 
@@ -1550,7 +1667,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
           sackMask = payloadStart;
           break;
         default:
-#ifdef RDP_DEGUG
+#ifdef RDP_DEBUG
           tlog(c->rdpSocket, LL_DEBUG, "unknown reserved bits.");
 #endif
           break;
@@ -1564,19 +1681,24 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       c->acknr = (pseqnr - 1) & RDP_SEQ_NR_MASK;
     }
 
+    // The distance between the latest packet we have sent to user and this
+    // packet minus 1. 0 is the right next packet we need.
     const uint seqCnt = (pseqnr - c->acknr - 1) & RDP_SEQ_NR_MASK;
 
     if (seqCnt >= RDP_QUEUE_SIZE_MAX) {
+      // Packet can't be placed in our input buffer.
       if (seqCnt >= (RDP_SEQ_NR_MASK + 1) - RDP_QUEUE_SIZE_MAX &&
           type != ST_STATE) {
-        // Some ack packets we send are lost.
+        // This is a duplicated packet.
         c->needSendAck = 1;
 
 #ifdef RDP_DEBUG
+        tlog(c->rdpSocket, LL_DEBUG, "get a duplicated packet");
+
         c->outOfDateSum++;
 #endif
       } else {
-        // Not expected seqnr.
+        // SeqCnt is far beyond our buffer size which is unexcepted.
 #ifdef RDP_DEBUG
         tlog(c->rdpSocket, LL_DEBUG, "packet wrong seqnr: %d.", seqCnt);
 #endif
@@ -1679,7 +1801,8 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       return -1;
     }
 
-    // Right next packet expected.
+    // This packet is the right next packet expected. Return it to user
+    // directly.
     if (seqCnt == 0) {
       if (payload > 0) {
 
@@ -1701,6 +1824,10 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       c->acknr++;
       c->needSendAck = 1;
 
+#ifdef RDP_DEBUG
+      ttlog(c->rdpSocket, LL_DEBUG, "get right next packet");
+#endif
+
       return payload == 0 ? -1 : payload;
     } else {
       // seqCnt != 0
@@ -1718,6 +1845,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
 #ifdef RDP_DEBUG
         c->duplicateSum++;
+        tlog(c->rdpSocket, LL_DEBUG, "get an out of order packet");
 #endif
 
         c->needSendAck = 1;
@@ -1751,13 +1879,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
   return -1;
 }
 
-void *rdpConnGetUserData(rdpConn *c) {
-  assert(c);
-  if (!c)
-    return NULL;
-
-  return c->userData;
-}
+void *rdpConnGetUserData(rdpConn *c) { return c->userData; }
 
 int rdpConnSetUserData(rdpConn *c, void *userData) {
   assert(c);
@@ -1808,6 +1930,10 @@ int rdpSocketSetProp(rdpSocket *s, int opt, int val) {
 // Use ack packet as keep alive probe.
 static void rdpConnKeepAlive(rdpConn *c) {
   c->acknr--;
+
+#ifdef RDP_DEBUG
+  tlog(c->rdpSocket, LL_DEBUG, "rdpConnKeepAlive");
+#endif
 
   sendAck(c);
 
@@ -1951,7 +2077,13 @@ static int rdpConnCheck(rdpConn *c) {
         resizeWindow(c);
 
         // Retransmitting.
-        rdpConnFlushPackets(c);
+        if (rdpConnFlushPackets(c) == -1) {
+#ifdef RDP_DEBUG
+          tlog(c->rdpSocket, LL_DEBUG,
+               "flush packets failed, connection full, sendId: %d, recvId: %d",
+               c->sendId, c->recvId);
+#endif
+        }
       }
 
       // Update after retransmit.
@@ -1967,6 +2099,10 @@ static int rdpConnCheck(rdpConn *c) {
 
     break;
   }
+  case CS_RESET:
+#ifdef RDP_DEBUG
+    tlog(c->rdpSocket, LL_DEBUG, "CS_RESET, need user invoke rdpConnClose()");
+#endif
   case CS_UNINITIALIZED:
   case CS_DESTROY:
     break;

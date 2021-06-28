@@ -14,12 +14,13 @@
 
 // Flags that rdpReadPoll() might returns.
 #define RDP_CONTINUE (1 << 0)
-#define RDP_AGAIN (1 << 1)
-#define RDP_ACCEPT (1 << 2)
-#define RDP_CONNECTED (1 << 3)
-#define RDP_DATA (1 << 4)
-#define RDP_POLLOUT (1 << 5)
-#define RDP_ERROR (1 << 9)
+#define RDP_AGAIN (1 << 1)      // Not drained fd.
+#define RDP_ACCEPT (1 << 2)     // Have passive new connection established.
+#define RDP_CONNECTED (1 << 3)  // Actively established connection connected.
+#define RDP_DATA (1 << 4)       // Data in the buffer to be read.
+#define RDP_POLLOUT (1 << 5)    // Have spare sapce for writing.
+#define RDP_CONN_ERROR (1 << 6) // The connection failed.
+#define RDP_ERROR (1 << 9)      // Invoke params error, or system call error.
 
 enum { RDP_PROP_FD, RDP_PROP_SNDBUF, RDP_PROP_RCVBUF };
 
