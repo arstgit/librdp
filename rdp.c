@@ -136,20 +136,24 @@ static const char *connStateNames[] = {
   Data type print abbreviations:
 
   Send:
+    S: ST_SYN.
     A: ST_STATE, Ack.
     E: ST_STATE, Eack.
+    F: FIN.
+    R: ST_RESET.
+    !: Connection is full, can't retransmit now.
 
   Receive:
+    s: ST_SYN.
+    t: ST_STATE.
     #: Out of date packets, aka packets with acknr are't bigger than our
   connection's acknr.
     .: The right next ST_DATA, aka packets with acknr are equal to our
   connection's acknr plus 1.
     -: First arrived out of order ST_DATA.
     +: Duplicated out of order ST_DATA.
-    F: FIN.
-    T: ST_STATE.
-    R: ST_RESET.
-    S: ST_SYN.
+    f: FIN.
+    r: ST_RESET.
 */
 
 #ifdef RDP_DEBUG
@@ -157,6 +161,7 @@ static const char *connStateNames[] = {
 static const char *packetStateNames[] = {"ST_DATA", "ST_FIN", "ST_STATE",
                                          "ST_RESET", "ST_SYN"};
 static const char *packetStateAbbrNames[] = {"", "F", "T", "R", "S"};
+static const char *packetStateAbbrNamesLower[] = {"", "f", "t", "r", "s"};
 
 #endif
 
@@ -212,8 +217,8 @@ struct rdpConn {
   struct rbuffer outbuf;
   rdpSocket *rdpSocket;
   void *userData; // User data variable.
-  uint64_t lastReceivedPacket;
-  uint64_t lastSentPacket;
+  uint64_t lastReceivePacketTime;
+  uint64_t lastSendPacketTime;
   uint32_t rtt;
   uint32_t rttVar;
   uint32_t nextRetransmitTimeout;
@@ -795,7 +800,7 @@ int rdpConnInit(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen,
   c->recvId = recvId;
   c->sendId = sendId;
 
-  c->lastReceivedPacket = c->rdpSocket->mstime;
+  c->lastReceivePacketTime = c->rdpSocket->mstime;
 
   // Attach this socket to context->rdpConns list.
   int n = dictAdd(c->rdpSocket->conns, c, NULL);
@@ -820,8 +825,8 @@ rdpConn *rdpConnCreate(rdpSocket *s) {
 
   memset(&c->addr, 0, sizeof(c->addr));
   c->addrlen = 0;
-  c->lastReceivedPacket = 0;
-  c->lastSentPacket = 0;
+  c->lastReceivePacketTime = 0;
+  c->lastSendPacketTime = 0;
   c->idSeed = 0;
   c->recvId = 0;
   c->sendId = 0;
@@ -865,7 +870,7 @@ ssize_t sendToAddr(rdpConn *c, const unsigned char *buf, size_t len) {
 }
 
 ssize_t sendData(rdpConn *c, unsigned char *buf, size_t len) {
-  c->lastSentPacket = c->rdpSocket->mstime;
+  c->lastSendPacketTime = c->rdpSocket->mstime;
 
   return sendToAddr(c, buf, len);
 }
@@ -881,6 +886,9 @@ ssize_t sendPacketWrap(rdpConn *c, struct packetWrap *pw) {
   p->acknr = c->acknr;
   pw->sentTime = c->rdpSocket->mstime;
   pw->transmissions++;
+
+  tlog(c->rdpSocket, LL_RAW | LL_DEBUG, "%s", packetStateAbbrNames[packetGetType(p)]);
+
   return sendData(c, (void *)pw->data, pw->payload + getPacketHeaderSize());
 }
 
@@ -1126,7 +1134,7 @@ static int rdpContextAck(rdpSocket *s) {
   return 0;
 }
 
-// Return -1 if connection is full.
+// Return -1 if the sending path is full.
 static int rdpConnFlushPackets(rdpConn *c) {
   for (uint16_t i = c->seqnr - c->queue; i != c->seqnr; i++) {
     struct packetWrap *pw = rbufferGet(&c->outbuf, i);
@@ -1606,8 +1614,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
   s->mstime = mstime();
 
-  // Print ST_SYN packets as "S"
-  tlog(s, LL_RAW | LL_DEBUG, "%s", packetStateAbbrNames[type]);
+  tlog(s, LL_RAW | LL_DEBUG, "%s", packetStateAbbrNamesLower[type]);
 
   if (type == ST_SYN) {
     *conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr, addrlen,
@@ -1630,7 +1637,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       (*conn)->acknr = pseqnr;
     }
 
-    (*conn)->lastReceivedPacket = (*conn)->rdpSocket->mstime;
+    (*conn)->lastReceivePacketTime = (*conn)->rdpSocket->mstime;
     (*conn)->retransmitTimeout = (*conn)->nextRetransmitTimeout;
     (*conn)->retransmitTicker =
         (*conn)->rdpSocket->mstime + (*conn)->retransmitTimeout;
@@ -1782,7 +1789,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       return -1;
     }
 
-    c->lastReceivedPacket = c->rdpSocket->mstime;
+    c->lastReceivePacketTime = c->rdpSocket->mstime;
 
     uint16_t ackCnt = (packnr - (c->seqnr - c->queue) + 1) & RDP_ACK_NR_MASK;
 
@@ -1897,6 +1904,8 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       // Print every the right next packet as a ".".
       tlog(c->rdpSocket, LL_RAW | LL_DEBUG, ".");
 
+      // Current packet might have filled the out of order hole.
+      // Invoke rdpReadPoll() again to try reading them.
       return payload == 0 ? -1 : payload;
     } else {
       // seqCnt != 0, this is an out of order packet.
@@ -1911,12 +1920,12 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
       if (rbufferGet(&c->inbuf, pseqnr) != NULL) {
 
-        c->outOfOrderDuplicatedSum++;
-
         // Print every duplicated out of order packet as "+".
         tlog(c->rdpSocket, LL_DEBUG | LL_RAW, "+");
 
         c->needSendAck = 1;
+
+        c->outOfOrderDuplicatedSum++;
 
         return -1;
       }
@@ -1930,14 +1939,14 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
       rbufferPut(&c->inbuf, pseqnr, packetWithPrefix);
 
-      c->outOfOrderCnt++;
-
-      c->outOfOrderSum++;
-
       // Print every unique out of order packet as "-".
       tlog(c->rdpSocket, LL_DEBUG | LL_RAW, "-");
 
       c->needSendAck = 1;
+
+      c->outOfOrderCnt++;
+
+      c->outOfOrderSum++;
 
       return -1;
     }
@@ -2108,21 +2117,21 @@ static int rdpConnCheck(rdpConn *c) {
     if (c->rdpSocket->mstime >= c->retransmitTicker) {
 
       if (c->state == CS_FIN_SENT &&
-          c->rdpSocket->mstime >= c->lastReceivedPacket + RDP_WAIT_FIN_SENT) {
+          c->rdpSocket->mstime >= c->lastReceivePacketTime + RDP_WAIT_FIN_SENT) {
         connStateSwitch(c, CS_DESTROY);
 
         return 0;
       }
 
       if (c->state == CS_SYN_RECV &&
-          c->rdpSocket->mstime >= c->lastReceivedPacket + RDP_WAIT_SYN_RECV) {
+          c->rdpSocket->mstime >= c->lastReceivePacketTime + RDP_WAIT_SYN_RECV) {
         connStateSwitch(c, CS_DESTROY);
 
         return 0;
       }
 
       if (c->queue > 0) {
-        // Prepare retransmit.
+        // Packet retransmit.
         for (uint16_t i = c->seqnr - c->queue; i != c->seqnr; i++) {
           struct packetWrap *pw = rbufferGet(&c->outbuf, i);
 
@@ -2141,7 +2150,7 @@ static int rdpConnCheck(rdpConn *c) {
         // Retransmitting.
         if (rdpConnFlushPackets(c) == -1) {
           // Connection is full of packets, can't retransmit now.
-          tlog(c->rdpSocket, LL_DEBUG | LL_RAW, "F");
+          tlog(c->rdpSocket, LL_DEBUG | LL_RAW, "!");
         }
       }
 
@@ -2150,7 +2159,7 @@ static int rdpConnCheck(rdpConn *c) {
     }
 
     if (c->state == CS_CONNECTED || c->state == CS_CONNECTED_FULL) {
-      if (c->rdpSocket->mstime >= c->lastSentPacket + RDP_KEEPALIVE_INTERVAL) {
+      if (c->rdpSocket->mstime >= c->lastSendPacketTime + RDP_KEEPALIVE_INTERVAL) {
 
         rdpConnKeepAlive(c);
       }
