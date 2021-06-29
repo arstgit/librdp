@@ -1,6 +1,6 @@
 # librtp
 
-Reliable datagram protocol. More aggressive bandwidth usage.
+Reliable datagram protocol based on UDP. More aggressive packet sending strategy.
 
 
 ## Prerequisites
@@ -23,15 +23,15 @@ rdpSocket *ctx = rdpSocketCreate(1, "127.0.0.1", "8888");
 // Establish a connection.
 rdpConn *conn = rdpNetConnect(ctx, "www.example.com", "8889");
 
-// Some user data can be attached to rdpConn.
-// It's the same for the rdpConn generated from accept connection.
+// Arbitrary user data pointer can be attached to rdpConn.
+// User can retrive the user data whenever needed. Usually after getting a RDP_DATA/RDP_ACCEPT/RDP_CONNECTED/RDP_CONN_ERROR.
 void * userData = NULL;
 rdpConnSetUserData(conn, userData);
 assert(rdpConnGetUserData(c) == userData);
 
 int efd = epoll_create1(0);
 
-// This is the fd rdpSocketCreate() opened.
+// This is the actual communicating fd rdpSocketCreate() using.
 int fd = rdpSocketGetProp(ctx, RDP_PROP_FD);
 
 struct epoll_event ev, epollEvents[10];
@@ -40,8 +40,8 @@ ev.data.fd = fd;
 epoll_ctl(efd, EPOLL_CTL_ADD, fd1, &ev);
 
 for (;;) {
-  // rdpSocketIntervalAction() is needed to execute some time related
-  // operations.
+  // rdpSocketIntervalAction() is needed to do some internal actions in time.
+  // Returns a timeout in milliseconds, indicating the time interval to next invoke. Usually passing it to epoll_wait is enough.
   int timeout = rdpSocketIntervalAction(ctx);
 
   n = epoll_wait(efd, epollEvents, 10, timeout);
@@ -60,23 +60,38 @@ for (;;) {
       int events;
 
       for (;;) {
-        // rdpReadPoll() gives us information about connection establishment, data arrivation, EOF etc.
-        // It's safe stop invoking rdpReadPoll() and break the loop only after got an RDP_ERROR or RDP_AGAIN.
+        // rdpReadPoll() gives us information about connection establishment, data arrival, EOF etc.
+        // User should invoke it over and over again until getting a RDP_ERROR or RDP_AGAIN, that's the only safe point jumping out the loop.
         ssize_t readCount = rdpReadPoll(ctx, buf, len, &newConn, &events);
         if (events & RDP_ERROR) {
-          // Usually this is caused of some wrong arguments were passed to
-          // rdpReadPoll().
+          // Unexpected error, invalid arguments and internal fault can be the cause.
+          // User should check the arguments passing to rdpReadPoll().
           goto exit;
         }
 
         if (events & RDP_AGAIN) {
-          // Here break the rdpReadPoll loop safely.
+          // RDP has drained the underground fd.
+          // It's time to break the loop safely.
           break;
         }
 
+        if (events & RDP_CONN_ERROR) {
+          // Connection have errors, usually because of receiving a RESET packet.
+          // rdpConnClose() should be invoked here.
+
+          userData = rdpConnGetUserData(conn);
+          // Do some sweeping if needed.
+
+          if (rdpConnClose(conn) == -1) {
+            // Error occured.
+          }
+          
+          continue;
+        }
+
         if (events & RDP_POLLOUT) {
-          // Corresponding rdpConn can be fetched through newConn here.
-          // Here can avoid getting an EAGAIN error when invoking rdpWrite().
+          // Indicate RDP have enough buffer space stroing output data now.
+          // It's time to write remaining data to sent if there is.
           for (;;) {
             int n = rdpWrite(newConn, "echo something back", 19);
             if (n == -1 && errno == EAGAIN) {
@@ -88,25 +103,20 @@ for (;;) {
         }
 
         if (events & RDP_ACCEPT) {
-          // Got an connection from the other end, usually it's from a client.
-          //
-          // Corresponding rdpConn can be fetched through newConn here.
+          // New connection incoming.
 
           struct sockaddr_storage addr;
           socklen_t len;
           // Fetch the address of the other end.
           rdpConnGetAddr(newConn, (struct sockaddr *)&addr, &len);
 
-          // rdpConnClose() must be invoked explicitly somewhere after
-          // usage. 
-          // If the arrived connection is not expected, invoke rdpConnClose() immediately here.
-          printf("new connection arrived.");
+          // Do something.
+
+          // rdpConnClose() should be invoked here or somewhere else explicitly.
         }
 
         if (events & RDP_CONNECTED) {
-          // Previous rdpNetConnect() succeeded.
-          //
-          // Corresponding rdpConn can be fetched through newConn here.
+          // New connection established.
 
           int n = rdpWrite(newConn, "hello.", 6);
           if (n == -1 && errno == EAGAIN) {
@@ -115,10 +125,7 @@ for (;;) {
         }
 
         if (events & RDP_DATA) {
-          // Received data have been ordered and copied into buf
-          // or an EOF arrived.
-          //
-          // Corresponding rdpConn can be fetched through newConn here.
+          // Data or EOF arrived.
 
           if (readCount > 0) {
             // Data arrived.
@@ -131,7 +138,7 @@ for (;;) {
           }
 
           if (readCount == 0) {
-            // Got an EOF from the other end.
+            // Received an EOF from the other end.
             printf("EOF");
 
             rdpConnClose(newConn);
@@ -139,7 +146,7 @@ for (;;) {
         }
 
         if (events & RDP_CONTINUE) {
-          // Continue, RDP_CONTINUE means rdpReadPoll() must be invoked again.
+          // Invoke rdpReadPoll() again immediately.
           continue;
         }
       }
