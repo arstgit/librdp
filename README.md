@@ -17,6 +17,8 @@ Environment:
 ## Usage
 
 ```c
+// Note: RDP don't have automatic connection destroy mechanism. Once user get a connection handle, from the invocation of rdpNetConnect() or rdpReadPoll() with RDP_ACCEPT event,  it's always user's job to invoke rdpConnClose() to destroy that connection.
+
 // rdpSocketCreate() opens one fd internally.
 rdpSocket *ctx = rdpSocketCreate(1, "127.0.0.1", "8888");
 

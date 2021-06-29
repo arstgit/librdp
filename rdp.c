@@ -153,9 +153,11 @@ static const char *connStateNames[] = {
 */
 
 #ifdef RDP_DEBUG
+
 static const char *packetStateNames[] = {"ST_DATA", "ST_FIN", "ST_STATE",
                                          "ST_RESET", "ST_SYN"};
 static const char *packetStateAbbrNames[] = {"", "F", "T", "R", "S"};
+
 #endif
 
 struct __attribute__((packed)) packet {
@@ -246,90 +248,6 @@ struct rdpConn {
   uint32_t outOfOrderSum;
 };
 
-static inline uint8_t connChangeState(rdpConn *c, uint8_t targetState) {
-  switch (c->state) {
-  case CS_UNINITIALIZED:
-    switch (targetState) {
-    case CS_SYN_SENT:
-    case CS_SYN_RECV:
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_SYN_SENT:
-    switch (targetState) {
-    case CS_CONNECTED:
-    case CS_DESTROY:
-      // Can change to CS_DESTROY directly because user haven't got the
-      // connection handle yet to invoke rdpConnClose().
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_SYN_RECV:
-    switch (targetState) {
-    case CS_CONNECTED:
-    case CS_RESET:
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_CONNECTED:
-    switch (targetState) {
-    case CS_CONNECTED_FULL:
-    case CS_FIN_SENT:
-    case CS_RESET:
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_CONNECTED_FULL:
-    switch (targetState) {
-    case CS_CONNECTED:
-    case CS_FIN_SENT:
-    case CS_RESET:
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_FIN_SENT:
-    switch (targetState) {
-    case CS_DESTROY:
-    case CS_RESET:
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_RESET:
-    switch (targetState) {
-    case CS_DESTROY:
-      return targetState;
-    default:
-      break;
-    }
-
-  case CS_DESTROY:
-    switch (targetState) {
-    default:
-      break;
-    }
-
-  default:
-    assert(0);
-  }
-
-  tlog(c->rdpSocket, LL_DEBUG, "wrong connection state change from: %s, to: %s",
-       connStateNames[c->state], connStateNames[targetState]);
-
-  assert(0);
-  return -1;
-}
 static inline size_t max(size_t a, size_t b) {
   if (a < b)
     return b;
@@ -578,6 +496,108 @@ static void _tlog(rdpSocket *rdpSocket, int level, const char *fmt, ...) {
 }
 #endif
 
+static inline void connStateInit(rdpConn *c) { c->state = CS_UNINITIALIZED; }
+
+static inline void connStateSwitch(rdpConn *c, uint8_t targetState) {
+
+#ifdef RDP_DEBUG
+
+  tlog(c->rdpSocket, LL_DEBUG, "%s -> %s", connStateNames[c->state],
+       connStateNames[targetState]);
+
+  switch (c->state) {
+  case CS_UNINITIALIZED:
+    switch (targetState) {
+    case CS_SYN_SENT:
+    case CS_SYN_RECV:
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_SYN_SENT:
+    switch (targetState) {
+    case CS_CONNECTED:
+    case CS_DESTROY:
+      // Can change to CS_DESTROY directly because user haven't got the
+      // connection handle yet to invoke rdpConnClose().
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_SYN_RECV:
+    switch (targetState) {
+    case CS_CONNECTED:
+    case CS_RESET:
+    case CS_DESTROY:
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_CONNECTED:
+    switch (targetState) {
+    case CS_CONNECTED_FULL:
+    case CS_FIN_SENT:
+    case CS_RESET:
+    case CS_DESTROY:
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_CONNECTED_FULL:
+    switch (targetState) {
+    case CS_CONNECTED:
+    case CS_FIN_SENT:
+    case CS_RESET:
+    case CS_DESTROY:
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_FIN_SENT:
+    switch (targetState) {
+    case CS_DESTROY:
+    case CS_RESET:
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_RESET:
+    switch (targetState) {
+    case CS_DESTROY:
+      goto validSwitch;
+    default:
+      goto invalidSwitch;
+    }
+
+  case CS_DESTROY:
+    switch (targetState) {
+    default:
+      goto invalidSwitch;
+    }
+
+  default:
+    assert(0);
+  }
+
+invalidSwitch:
+  assert(0);
+
+validSwitch:
+  c->state = targetState;
+  return;
+
+#else
+
+  c->state = targetState;
+
+#endif
+}
 // See dict.h.
 uint64_t rdpConnHashCallback(const void *key) {
   rdpConn *c = (rdpConn *)key;
@@ -796,7 +816,7 @@ rdpConn *rdpConnCreate(rdpSocket *s) {
   }
   c->rdpSocket = s;
   c->userData = NULL;
-  c->state = CS_UNINITIALIZED;
+  connStateInit(c);
 
   memset(&c->addr, 0, sizeof(c->addr));
   c->addrlen = 0;
@@ -870,10 +890,8 @@ int rdpConnect(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen) {
     return -1;
 
   if (c->state != CS_UNINITIALIZED) {
-#ifdef RDP_DEBUG
     tlog(c->rdpSocket, LL_DEBUG, "rdpConnect not expected state: %s",
          connStateNames[c->state]);
-#endif
 
     return -1;
   }
@@ -881,7 +899,7 @@ int rdpConnect(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen) {
   c->rdpSocket->mstime = mstime();
 
   rdpConnInit(c, addr, addrlen, 1, 0, 0, 1);
-  c->state = CS_SYN_SENT;
+  connStateSwitch(c, CS_SYN_SENT);
 
   c->retransmitTimeout = c->nextRetransmitTimeout;
   c->retransmitTicker = c->rdpSocket->mstime + c->retransmitTimeout;
@@ -1271,7 +1289,8 @@ ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec, size_t vecCnt) {
     total += vec[i].len;
 
   if (rdpConnFlightWindowFull(c)) {
-    c->state = CS_CONNECTED_FULL;
+    connStateSwitch(c, CS_CONNECTED_FULL);
+
     errno = EAGAIN;
     return -1;
   }
@@ -1296,7 +1315,7 @@ ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec, size_t vecCnt) {
   }
 
   if (rdpConnFlushPackets(c) == -1) {
-    c->state = CS_CONNECTED_FULL;
+    connStateSwitch(c, CS_CONNECTED_FULL);
   }
 
   if (sent == 0) {
@@ -1342,7 +1361,7 @@ int rdpConnClose(rdpConn *c) {
 
     // Passive close.
     if (c->receivedFin) {
-      c->state = CS_DESTROY;
+      connStateSwitch(c, CS_DESTROY);
 
       tlog(c->rdpSocket, LL_DEBUG,
            "change state to CS_DESTROY, passive close receivedFin.");
@@ -1355,18 +1374,19 @@ int rdpConnClose(rdpConn *c) {
     buildSendPacket(c, 0, ST_FIN, NULL, 0);
     rdpConnFlushPackets(c);
 
-    c->state = CS_FIN_SENT;
+    connStateSwitch(c, CS_FIN_SENT);
 
     return 0;
   case CS_SYN_SENT:
-    c->state = CS_DESTROY;
+    connStateSwitch(c, CS_DESTROY);
     tlog(c->rdpSocket, LL_DEBUG,
          "change state to CS_DESTROY, invoked rdpConnClose() on CS_SYN_SENT.");
     return 0;
   case CS_RESET:
-    c->state = CS_DESTROY;
+    connStateSwitch(c, CS_DESTROY);
     return 0;
   default:
+    dprintf(2, "state: %s", c->state);
     assert(0);
   }
 
@@ -1605,7 +1625,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       *conn = rdpConnCreate(s);
       rdpConnInit(*conn, (const struct sockaddr *)&addr, addrlen, 0, connId,
                   connId + 1, connId);
-      (*conn)->state = CS_SYN_RECV;
+      connStateSwitch((*conn), CS_SYN_RECV);
 
       (*conn)->acknr = pseqnr;
     }
@@ -1654,7 +1674,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
           case CS_FIN_SENT:
             // User have already invoked rdpConnClose(), shouldn't be
             // notified.
-            (*conn)->state = CS_DESTROY;
+            connStateSwitch((*conn), CS_DESTROY);
             break;
           case CS_SYN_SENT:
           case CS_CONNECTED_FULL:
@@ -1662,7 +1682,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
             // User have got this connection handle, should be notified to do
             // some sweep jobs.
 
-            (*conn)->state = CS_RESET;
+            connStateSwitch((*conn), CS_RESET);
             *events = RDP_CONN_ERROR;
             break;
           case CS_RESET:
@@ -1774,19 +1794,19 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
     // Connection handshake.
     if (type == ST_DATA && c->state == CS_SYN_RECV) {
-      c->state = CS_CONNECTED;
+      connStateSwitch(c, CS_CONNECTED);
       *events = RDP_ACCEPT;
     }
 
     if (type == ST_STATE && c->state == CS_SYN_SENT) {
       // Outgoing connection completion.
-      c->state = CS_CONNECTED;
+      connStateSwitch(c, CS_CONNECTED);
       *events = RDP_CONNECTED;
     }
 
     if (c->state == CS_FIN_SENT && c->queue == ackCnt) {
       // Active close completion.
-      c->state = CS_DESTROY;
+      connStateSwitch(c, CS_DESTROY);
 
       tlog(c->rdpSocket, LL_DEBUG,
            "change state to CS_DESTROY, active close completion.");
@@ -1815,11 +1835,9 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 #endif
 
     if (c->state == CS_CONNECTED_FULL && !rdpConnFlightWindowFull(c)) {
-      c->state = CS_CONNECTED;
+      connStateSwitch(c, CS_CONNECTED);
 
       *events |= RDP_POLLOUT;
-
-      tlog(c->rdpSocket, LL_DEBUG, "full -----------> not full");
     }
 
     if (type == ST_STATE) {
@@ -1835,7 +1853,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
     if (type == ST_FIN) {
       if (c->state == CS_FIN_SENT) {
-        c->state = CS_DESTROY;
+        connStateSwitch(c, CS_DESTROY);
 
         return -1;
       }
@@ -2091,14 +2109,14 @@ static int rdpConnCheck(rdpConn *c) {
 
       if (c->state == CS_FIN_SENT &&
           c->rdpSocket->mstime >= c->lastReceivedPacket + RDP_WAIT_FIN_SENT) {
-        c->state = CS_DESTROY;
+        connStateSwitch(c, CS_DESTROY);
 
         return 0;
       }
 
       if (c->state == CS_SYN_RECV &&
           c->rdpSocket->mstime >= c->lastReceivedPacket + RDP_WAIT_SYN_RECV) {
-        c->state = CS_DESTROY;
+        connStateSwitch(c, CS_DESTROY);
 
         return 0;
       }
