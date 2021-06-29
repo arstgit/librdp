@@ -113,7 +113,7 @@ enum connState {
   CS_CONNECTED_FULL,
   CS_FIN_SENT, // Only the invocation of rdpConnClose() can trigger this.
   CS_RESET, // Connection get a ST_RESET packet, change it's state to CS_RESET
-            // not CS_DESTORY for getting user a chance to be notified and do
+            // not CS_DESTROY for getting user a chance to be notified and do
             // some sweep job. Once received ST_RESET packet, it's user's job to
             // change it to CS_DESTROY by invoking rdpConnClose().
   CS_DESTROY // Should be set only after the invocation of rdpConnClose().
@@ -125,12 +125,32 @@ static const char *connStateNames[] = {
     "CS_CONNECTED_FULL", "CS_FIN_SENT", "CS_RESET",    "CS_DESTROY"};
 #endif
 
-// Packet types. See also: http://bittorrent.org/beps/bep_0029.html
+// Packet types. See: http://bittorrent.org/beps/bep_0029.html
 #define ST_DATA 0
 #define ST_FIN 1
 #define ST_STATE 2
 #define ST_RESET 3
 #define ST_SYN 4
+
+/*
+  Data type print abbreviations:
+
+  Send:
+    A: ST_STATE, Ack.
+    E: ST_STATE, Eack.
+
+  Receive:
+    #: Out of date packets, aka packets with acknr are't bigger than our
+  connection's acknr.
+    .: The right next ST_DATA, aka packets with acknr are equal to our
+  connection's acknr plus 1.
+    -: First arrived out of order ST_DATA.
+    +: Duplicated out of order ST_DATA.
+    F: FIN.
+    T: ST_STATE.
+    R: ST_RESET.
+    S: ST_SYN.
+*/
 
 #ifdef RDP_DEBUG
 static const char *packetStateNames[] = {"ST_DATA", "ST_FIN", "ST_STATE",
@@ -226,6 +246,90 @@ struct rdpConn {
   uint32_t outOfOrderSum;
 };
 
+static inline uint8_t connChangeState(rdpConn *c, uint8_t targetState) {
+  switch (c->state) {
+  case CS_UNINITIALIZED:
+    switch (targetState) {
+    case CS_SYN_SENT:
+    case CS_SYN_RECV:
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_SYN_SENT:
+    switch (targetState) {
+    case CS_CONNECTED:
+    case CS_DESTROY:
+      // Can change to CS_DESTROY directly because user haven't got the
+      // connection handle yet to invoke rdpConnClose().
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_SYN_RECV:
+    switch (targetState) {
+    case CS_CONNECTED:
+    case CS_RESET:
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_CONNECTED:
+    switch (targetState) {
+    case CS_CONNECTED_FULL:
+    case CS_FIN_SENT:
+    case CS_RESET:
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_CONNECTED_FULL:
+    switch (targetState) {
+    case CS_CONNECTED:
+    case CS_FIN_SENT:
+    case CS_RESET:
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_FIN_SENT:
+    switch (targetState) {
+    case CS_DESTROY:
+    case CS_RESET:
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_RESET:
+    switch (targetState) {
+    case CS_DESTROY:
+      return targetState;
+    default:
+      break;
+    }
+
+  case CS_DESTROY:
+    switch (targetState) {
+    default:
+      break;
+    }
+
+  default:
+    assert(0);
+  }
+
+  tlog(c->rdpSocket, LL_DEBUG, "wrong connection state change from: %s, to: %s",
+       connStateNames[c->state], connStateNames[targetState]);
+
+  assert(0);
+  return -1;
+}
 static inline size_t max(size_t a, size_t b) {
   if (a < b)
     return b;
@@ -1642,8 +1746,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
 
     if (seqCnt >= RDP_QUEUE_SIZE_MAX) {
       // Packet can't be placed in our input buffer.
-      if (seqCnt >= (RDP_SEQ_NR_MASK + 1) - RDP_QUEUE_SIZE_MAX &&
-          type != ST_STATE) {
+      if (seqCnt >= (RDP_SEQ_NR_MASK + 1) - RDP_QUEUE_SIZE_MAX) {
         // This is a outdated duplicated packet.
         c->needSendAck = 1;
 
