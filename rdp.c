@@ -46,6 +46,11 @@
 #define RDP_WINDOW_SIZE_MAX RDP_BUFFER_SIZE_MAX
 #define RDP_WINDOW_SIZE_DEFAULT (RDP_BUFFER_SIZE_MAX / 4)
 
+// Minium Interval between resize flight window. In milliseconds.
+// Don't need the maxinum part because resize is triggered by packets arrival.
+// It's no need to resize if no packets.
+#define RDP_RESIZE_WINDOW_INTERVAL_MIN 1000
+
 // See resizeWindow() implemention.
 #define RDP_WINDOW_SHRINK_FACTOR 2
 #define RDP_WINDOW_EXPAND_FACTOR 2
@@ -57,7 +62,6 @@
 #define RDP_RETRANSMIT_TIMEOUT_MIN 200
 #define RDP_RETRANSMIT_TIMEOUT_MAX 1000
 #define RDP_RETRANSMIT_TIMEOUT_DEFAULT 500
-// #define RDP_RETRANSMIT_TIMEOUT_STEP 50
 
 // Keep alive probes interval.
 #define RDP_KEEPALIVE_INTERVAL 29000
@@ -139,6 +143,7 @@ static const char *connStateNames[] = {
     S: ST_SYN.
     A: ST_STATE, Ack.
     E: ST_STATE, Eack.
+    D: ST_DATA.
     F: FIN.
     R: ST_RESET.
     !: Connection is full, can't retransmit now.
@@ -160,7 +165,7 @@ static const char *connStateNames[] = {
 
 static const char *packetStateNames[] = {"ST_DATA", "ST_FIN", "ST_STATE",
                                          "ST_RESET", "ST_SYN"};
-static const char *packetStateAbbrNames[] = {"", "F", "T", "R", "S"};
+static const char *packetStateAbbrNames[] = {"D", "F", "T", "R", "S"};
 static const char *packetStateAbbrNamesLower[] = {"", "f", "t", "r", "s"};
 
 #endif
@@ -169,8 +174,8 @@ struct __attribute__((packed)) packet {
   uint8_t versionAndType; // First 4 bits specify version, last 4 bits specify
                           // packet type.
   uint8_t reserve;
-  uint16_t connId;
-  uint32_t window;
+  uint16_t connId; // connId = sender's sendId = received's recvId.
+  uint32_t window; // Not implemented yet, using default max value for now.
   uint16_t seqnr;
   uint16_t acknr;
 };
@@ -221,16 +226,21 @@ struct rdpConn {
   uint64_t lastSendPacketTime;
   uint32_t rtt;
   uint32_t rttVar;
-  uint32_t nextRetransmitTimeout;
-  uint32_t retransmitTimeout;
+  int32_t
+      nextRetransmitTimeout; // Calculated from RTT when ACK packets arrived.
+  int32_t retransmitTimeout;
   uint64_t retransmitTicker;
   enum connState state;
-  uint32_t flightWindow;      // In bytes.
+  uint32_t flightWindow; // In bytes. Within a retransmitTimeout packets sent
+                         // but not ACKed.
   uint32_t flightWindowLimit; // In bytes.
   uint32_t recvWindowPeer; // This is the window size we received from packets
                            // the other end sent.
   uint32_t recvWindowSelf; // This is our receive window.
-  int32_t oldestResent;
+  uint32_t lastResizeWindowTime;
+  uint32_t sentBytesSinceResizeWindow;
+  uint32_t ackedBytesSinceResizeWindow;
+
   uint16_t idSeed;
   // On the connection initial end, sendId = recvId + 1, the other end, sendId =
   // recvId - 1.
@@ -379,7 +389,7 @@ static inline size_t getMaxPacketPayloadSize() {
 
 // Return a valid retransmit timeout.
 // Return default timeout if t equals zero.
-static inline uint32_t limitedRetransmitTimeout(uint32_t t) {
+static inline uint32_t boundedRetransmitTimeout(uint32_t t) {
   if (t > 0) {
     return min(RDP_RETRANSMIT_TIMEOUT_MAX, max(RDP_RETRANSMIT_TIMEOUT_MIN, t));
   }
@@ -396,7 +406,7 @@ static inline uint32_t limitedWindow(uint32_t t) {
 }
 
 #ifdef RDP_DEBUG
-static int isLeapYear(time_t year) {
+static inline int isLeapYear(time_t year) {
   if (year % 4)
     return 0; /* A year not divisible by 4 is not leap. */
   else if (year % 100)
@@ -406,7 +416,8 @@ static int isLeapYear(time_t year) {
   else
     return 1; /* If div by 100 and 400 is leap. */
 }
-static void nolocksLocaltime(struct tm *tmp, time_t t, time_t tz, int dst) {
+static inline void nolocksLocaltime(struct tm *tmp, time_t t, time_t tz,
+                                    int dst) {
   const time_t secs_min = 60;
   const time_t secs_hour = 3600;
   const time_t secs_day = 3600 * 24;
@@ -454,7 +465,7 @@ static void nolocksLocaltime(struct tm *tmp, time_t t, time_t tz, int dst) {
   tmp->tm_year -= 1900;    /* Surprisingly tm_year is year-1900. */
 }
 
-static void tlogRaw(rdpSocket *rdpSocket, int level, const char *msg) {
+static inline void tlogRaw(rdpSocket *rdpSocket, int level, const char *msg) {
   const char *c = ".-*#";
   char buf[64];
   char outputMsg[LOG_MAX_LEN + 64];
@@ -486,7 +497,8 @@ static void tlogRaw(rdpSocket *rdpSocket, int level, const char *msg) {
 }
 
 //  Printf-alike style log utility.
-static void _tlog(rdpSocket *rdpSocket, int level, const char *fmt, ...) {
+static inline void _tlog(rdpSocket *rdpSocket, int level, const char *fmt,
+                         ...) {
   va_list ap;
   char msg[LOG_MAX_LEN];
 
@@ -604,14 +616,14 @@ validSwitch:
 #endif
 }
 // See dict.h.
-uint64_t rdpConnHashCallback(const void *key) {
+static inline uint64_t rdpConnHashCallback(const void *key) {
   rdpConn *c = (rdpConn *)key;
 
   return dictHashFnDefault((unsigned char *)&c->recvId, 1);
 }
 
 // Dict node deletion callback.
-void rdpConnDestructor(void *val) {
+static inline void rdpConnDestructor(void *val) {
   rdpConn *c = (rdpConn *)val;
 
   rbufferFree(&c->inbuf);
@@ -624,7 +636,7 @@ void rdpConnDestructor(void *val) {
 // Using three fields of rdpConn: recvId, addr, addrlen to determine
 // equlity.
 // Return 1 if equal, otherwise 0.
-int rdpConnCmp(const void *key1, const void *key2) {
+static inline int rdpConnCmp(const void *key1, const void *key2) {
   rdpConn *c1, *c2;
 
   c1 = (rdpConn *)key1;
@@ -641,7 +653,7 @@ int rdpConnCmp(const void *key1, const void *key2) {
 
 // Just Invoke listNodeDestroy() is enough, actions free internal struct is
 // registerd in list.
-static int rdpConnDestroy(rdpConn *c) {
+static inline int rdpConnDestroy(rdpConn *c) {
   // Not registered in rdpSocket->conns.
   if (!(c->addrlen || c->idSeed)) {
     rdpConnDestructor((void *)c);
@@ -655,8 +667,8 @@ static int rdpConnDestroy(rdpConn *c) {
 }
 
 // Create a UDP socket, bound to address "node:service".
-static int inetSocket(const char *node, const char *service,
-                      socklen_t *addrlen) {
+static inline int inetSocket(const char *node, const char *service,
+                             socklen_t *addrlen) {
   struct addrinfo hints;
   struct addrinfo *result, *rp;
   int sfd, optval, s;
@@ -763,9 +775,10 @@ int rdpSocketDestroy(rdpSocket *s) {
 }
 
 // Make a fake rdpConn to compare.
-static rdpConn *findRdpConnInRdpSocket(rdpSocket *s,
-                                       const struct sockaddr *addr,
-                                       socklen_t addrlen, uint16_t recvId) {
+static inline rdpConn *findRdpConnInRdpSocket(rdpSocket *s,
+                                              const struct sockaddr *addr,
+                                              socklen_t addrlen,
+                                              uint16_t recvId) {
   rdpConn comparedValue;
 
   memcpy(&comparedValue.addr, addr, addrlen);
@@ -801,6 +814,8 @@ int rdpConnInit(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen,
   c->sendId = sendId;
 
   c->lastReceivePacketTime = c->rdpSocket->mstime;
+
+  c->lastResizeWindowTime = c->rdpSocket->mstime;
 
   // Attach this socket to context->rdpConns list.
   int n = dictAdd(c->rdpSocket->conns, c, NULL);
@@ -842,12 +857,14 @@ rdpConn *rdpConnCreate(rdpSocket *s) {
   c->flightWindowLimit = limitedWindow(0);
   c->recvWindowPeer = limitedWindow(RDP_WINDOW_SIZE_MAX);
   c->recvWindowSelf = limitedWindow(RDP_WINDOW_SIZE_MAX);
+  c->lastResizeWindowTime = 0;
+  c->sentBytesSinceResizeWindow = 0;
+  c->ackedBytesSinceResizeWindow = 0;
   c->rtt = 0;
   c->rttVar = 0;
-  c->nextRetransmitTimeout = limitedRetransmitTimeout(0);
+  c->nextRetransmitTimeout = boundedRetransmitTimeout(0);
   c->retransmitTimeout = 0;
   c->retransmitTicker = 0;
-  c->oldestResent = -1;
   rbufferInit(&c->inbuf);
   rbufferInit(&c->outbuf);
 
@@ -860,7 +877,8 @@ rdpConn *rdpConnCreate(rdpSocket *s) {
   return c;
 }
 
-ssize_t sendToAddr(rdpConn *c, const unsigned char *buf, size_t len) {
+static inline ssize_t sendToAddr(rdpConn *c, const unsigned char *buf,
+                                 size_t len) {
   ssize_t n;
 
   n = sendto(c->rdpSocket->fd, buf, len, 0, (const struct sockaddr *)&c->addr,
@@ -869,16 +887,18 @@ ssize_t sendToAddr(rdpConn *c, const unsigned char *buf, size_t len) {
   return n;
 }
 
-ssize_t sendData(rdpConn *c, unsigned char *buf, size_t len) {
+static inline ssize_t sendData(rdpConn *c, unsigned char *buf, size_t len) {
   c->lastSendPacketTime = c->rdpSocket->mstime;
 
   return sendToAddr(c, buf, len);
 }
 
-ssize_t sendPacketWrap(rdpConn *c, struct packetWrap *pw) {
+static inline ssize_t sendPacketWrap(rdpConn *c, struct packetWrap *pw) {
   assert(pw->transmissions == 0 || pw->needResend);
 
   c->flightWindow += pw->payload;
+
+  c->sentBytesSinceResizeWindow += pw->payload;
 
   pw->needResend = 0;
 
@@ -887,7 +907,8 @@ ssize_t sendPacketWrap(rdpConn *c, struct packetWrap *pw) {
   pw->sentTime = c->rdpSocket->mstime;
   pw->transmissions++;
 
-  tlog(c->rdpSocket, LL_RAW | LL_DEBUG, "%s", packetStateAbbrNames[packetGetType(p)]);
+  tlog(c->rdpSocket, LL_RAW | LL_DEBUG, "%s",
+       packetStateAbbrNames[packetGetType(p)]);
 
   return sendData(c, (void *)pw->data, pw->payload + getPacketHeaderSize());
 }
@@ -947,7 +968,7 @@ static inline int sixteenAfter(uint16_t a, uint16_t b) {
 // Return 1 if full, otherwise 0.
 //
 // Not full means the flight window has spaces for a maximum packet.
-static int rdpConnFlightWindowFull(rdpConn *c) {
+static inline int rdpConnFlightWindowFull(rdpConn *c) {
   if (c->flightWindow + (uint32_t)getMaxPacketPayloadSize() >
       (uint32_t)min(c->flightWindowLimit, c->recvWindowPeer)) {
     return 1;
@@ -957,16 +978,14 @@ static int rdpConnFlightWindowFull(rdpConn *c) {
 }
 
 // Ack the packet registered in rdpConn->outbuf.
-static int ackPacket(rdpConn *c, uint16_t i) {
+static inline int ackPacket(rdpConn *c, uint16_t i) {
   struct packetWrap *pw = (struct packetWrap *)rbufferGet(&c->outbuf, i);
 
   if (!pw)
     return -1;
 
   if (pw->transmissions == 0) {
-#ifdef RDP_DEBUG
-    tlog(c->rdpSocket, LL_DEBUG, "ack packet not sent.");
-#endif
+    tlog(c->rdpSocket, LL_DEBUG, "packet not sent been acked.");
     return -1;
   }
 
@@ -982,14 +1001,17 @@ static int ackPacket(rdpConn *c, uint16_t i) {
       c->rtt += ((int)packetRtt - (int)c->rtt) / 8;
     }
 
-    c->nextRetransmitTimeout = limitedRetransmitTimeout(c->rtt + c->rttVar * 4);
+    c->nextRetransmitTimeout = boundedRetransmitTimeout(c->rtt + c->rttVar * 4);
   }
 
-  // Timeout packets are not included in flightWindow.
+  // Resent packet didn't contribute to flightWindow.
   if (!pw->needResend) {
     assert(c->flightWindow >= pw->payload);
+
     c->flightWindow -= pw->payload;
   }
+
+  c->ackedBytesSinceResizeWindow += pw->payload;
 
   free(pw);
 
@@ -997,7 +1019,7 @@ static int ackPacket(rdpConn *c, uint16_t i) {
 }
 
 // Send an ack packet.
-static ssize_t sendAck(rdpConn *c) {
+static inline ssize_t sendAck(rdpConn *c) {
   size_t packetLen;
   struct packet *p;
 
@@ -1075,8 +1097,8 @@ static ssize_t sendAck(rdpConn *c) {
 }
 
 // ST_RESET packet's connection id should be the sendId of the other end.
-static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
-                         socklen_t addrlen, uint16_t connId) {
+static inline ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
+                                socklen_t addrlen, uint16_t connId) {
   size_t packetLen;
   struct packet *p;
   int n;
@@ -1100,7 +1122,7 @@ static ssize_t sendReset(int fd, const struct sockaddr *dest_addr,
 }
 
 // Send ack packets on all rdpConns if needed.
-static int rdpContextAck(rdpSocket *s) {
+static inline int rdpContextAck(rdpSocket *s) {
   if (!s)
     return -1;
 
@@ -1135,9 +1157,11 @@ static int rdpContextAck(rdpSocket *s) {
 }
 
 // Return -1 if the sending path is full.
-static int rdpConnFlushPackets(rdpConn *c) {
+static inline int rdpConnFlushPackets(rdpConn *c) {
   for (uint16_t i = c->seqnr - c->queue; i != c->seqnr; i++) {
     struct packetWrap *pw = rbufferGet(&c->outbuf, i);
+    // Fresh packets, and stale packets reached retransmit timeoout will be
+    // sent.
     if (pw == NULL || (pw->transmissions > 0 && pw->needResend == 0))
       continue;
 
@@ -1151,8 +1175,8 @@ static int rdpConnFlushPackets(rdpConn *c) {
   return 0;
 }
 
-static void buildSendPacket(rdpConn *c, size_t payload, uint type,
-                            struct rdpVec *vec, size_t vecCnt) {
+static inline void buildSendPacket(rdpConn *c, size_t payload, uint type,
+                                   struct rdpVec *vec, size_t vecCnt) {
   assert(c->queue > 0 || (c->queue == 0 && c->flightWindow == 0));
 
   size_t maxPacketPayloadSize = getMaxPacketPayloadSize();
@@ -1242,7 +1266,8 @@ static void buildSendPacket(rdpConn *c, size_t payload, uint type,
 }
 
 // CS_CONNECTED -> CS_CONNECTED_FULL can happen in this function only.
-ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec, size_t vecCnt) {
+static inline ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec,
+                                  size_t vecCnt) {
   if (!c) {
     errno = EINVAL;
     return -1;
@@ -1401,8 +1426,8 @@ int rdpConnClose(rdpConn *c) {
   return 0;
 }
 
-int selectiveAck(rdpConn *c, uint32_t startSeqnr, const uint8_t *mask,
-                 uint8_t len) {
+static inline int selectiveAck(rdpConn *c, uint32_t startSeqnr,
+                               const uint8_t *mask, uint8_t len) {
   int offset = len * 8 - 1;
 
   do {
@@ -1655,8 +1680,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
         // Unindentified packet, send back a ST_RESET packet with the original
         // connection id, aka, the sender's sendId.
 
-        tlog(s, LL_DEBUG, "received unknown packet, send ST_RESET, connId: %d",
-             connId);
+        tlog(s, LL_RAW | LL_DEBUG, "R");
 
         sendReset(s->fd, (const struct sockaddr *)&addr, addrlen, connId);
       } else {
@@ -1668,10 +1692,6 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
             ((*conn = findRdpConnInRdpSocket(s, (const struct sockaddr *)&addr,
                                              addrlen, connId - 1)) &&
              ((*conn)->sendId == connId))) {
-          tlog(s, LL_DEBUG,
-               "received ST_RESET, destroy connection, recvId: %d, sendId: %d",
-               (*conn)->recvId, (*conn)->sendId);
-
           switch ((*conn)->state) {
           case CS_UNINITIALIZED:
             // Haven't reached outside world. Corrupted packet maybe.
@@ -1835,11 +1855,9 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
       selectiveAck(c, packnr + 2, sackMask, sackMask[-1]);
     }
 
-#ifdef RDP_DEBUG
     if (c->queue == 0)
       assert(c->flightWindow == 0);
     assert(c->queue == 0 || rbufferGet(&c->outbuf, c->seqnr - c->queue));
-#endif
 
     if (c->state == CS_CONNECTED_FULL && !rdpConnFlightWindowFull(c)) {
       connStateSwitch(c, CS_CONNECTED);
@@ -2008,7 +2026,7 @@ int rdpSocketSetProp(rdpSocket *s, int opt, int val) {
 }
 
 // Use ack packet as keep alive probe.
-static void rdpConnKeepAlive(rdpConn *c) {
+static inline void rdpConnKeepAlive(rdpConn *c) {
   c->acknr--;
 
   tlog(c->rdpSocket, LL_DEBUG, "rdpConnKeepAlive");
@@ -2018,48 +2036,30 @@ static void rdpConnKeepAlive(rdpConn *c) {
   c->acknr++;
 }
 
-static int resizeWindow(rdpConn *c) {
-  struct packetWrap *pw =
-      (struct packetWrap *)rbufferGet(&c->outbuf, c->seqnr - c->queue);
-
-  assert(pw);
-
-  // Have't start retransmit. Do nothing.
-  if (c->oldestResent == -1) {
-
-    c->oldestResent = c->seqnr - c->queue;
-
-    return 0;
-  }
-
-  // No respond from last retransmit.
-  // Shrink the window until it have only one packet space.
-  if (c->oldestResent == c->seqnr - c->queue) {
+static inline int resizeWindow(rdpConn *c) {
+  // Shrink when no packets sent have acked, until the window can fit only one
+  // packet.
+  if (c->ackedBytesSinceResizeWindow == 0 &&
+      c->sentBytesSinceResizeWindow > 0) {
     c->flightWindowLimit =
-        limitedWindow(c->flightWindowLimit / RDP_WINDOW_SHRINK_FACTOR);
-
-    return 0;
-  }
-
-  // Last retransmit succeed. Expand it.
-  if (c->oldestResent != c->seqnr - c->queue) {
+        limitedWindow(c->flightWindow / RDP_WINDOW_SHRINK_FACTOR);
+  } else if (c->ackedBytesSinceResizeWindow > 0) {
     c->flightWindowLimit =
         limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FACTOR);
-
-    c->oldestResent = c->seqnr - c->queue;
-
-    return 0;
+  } else {
+    // Stay the same.
   }
 
-  assert(0);
+  c->ackedBytesSinceResizeWindow = c->sentBytesSinceResizeWindow = 0;
 
-  return -1;
+  return 0;
 }
 
-// Only update after process the previous retransmit event.
-static int updateRetransmitTimeout(rdpConn *c) {
-  uint32_t afterLastSent = 0;
+// Only update after the end of a retransmit event.
+static inline int updateRetransmitTimeout(rdpConn *c) {
+  uint32_t lastSendTimeToNow = 0;
   if (c->queue != 0) {
+    // Retrieve the oldest sent but not acked packet in output buffer.
     struct packetWrap *pw =
         (struct packetWrap *)rbufferGet(&c->outbuf, c->seqnr - c->queue);
 
@@ -2067,44 +2067,23 @@ static int updateRetransmitTimeout(rdpConn *c) {
     assert(pw->transmissions);
     assert(pw->sentTime);
 
-    afterLastSent = c->rdpSocket->mstime - pw->sentTime;
+    lastSendTimeToNow = c->rdpSocket->mstime - pw->sentTime;
   }
 
   // Update retransmitTimeout.
-  c->retransmitTimeout = c->nextRetransmitTimeout - afterLastSent;
+  c->retransmitTimeout = c->nextRetransmitTimeout - lastSendTimeToNow;
+
   if (c->retransmitTimeout < 0)
     c->retransmitTimeout = 0;
 
-  // retransmitTicker of rdpConn can only be updated here.
+  // retransmitTicker of connection can only be updated here.
   c->retransmitTicker = c->rdpSocket->mstime + c->retransmitTimeout;
 
   return 0;
 }
 
 // Flush packets and send acks.
-static int rdpConnCheck(rdpConn *c) {
-
-#ifdef RDP_DEBUG
-
-  int inbufCnt = rbufferGetFilled(&c->inbuf);
-  int outbufCnt = rbufferGetFilled(&c->outbuf);
-
-  if (inbufCnt > 0 || outbufCnt > 0) {
-    //    tlog(c->rdpSocket, LL_DEBUG,
-    //         "conn id: %d, state: %s, outoforder: %d, inbuf: %d, outbuf: "
-    //         "%d, flight window: "
-    //         "%d, window "
-    //         "queue: %d, errInfo: %s",
-    //         c->recvId, connStateNames[c->state], c->outOfOrderCnt,
-    //         inbufCnt, outbufCnt, c->flightWindow, c->queue, c->errInfo);
-    //
-    // tlog(c->rdpSocket, LL_DEBUG,
-    //     "out of date sum: %d, out of order sum: %d, duplicate sum: %d",
-    //     c->outOfDateSum, c->outOfOrderSum, c->outOfOrderDuplicatedSum);
-  }
-
-#endif
-
+static inline int rdpConnCheck(rdpConn *c) {
   assert(c->queue == 0 || rbufferGet(&c->outbuf, c->seqnr - c->queue));
 
   switch (c->state) {
@@ -2116,36 +2095,43 @@ static int rdpConnCheck(rdpConn *c) {
     // It's time for the connection timeout check.
     if (c->rdpSocket->mstime >= c->retransmitTicker) {
 
+      // FIN wait timeout.
       if (c->state == CS_FIN_SENT &&
-          c->rdpSocket->mstime >= c->lastReceivePacketTime + RDP_WAIT_FIN_SENT) {
+          c->rdpSocket->mstime >=
+              c->lastReceivePacketTime + RDP_WAIT_FIN_SENT) {
         connStateSwitch(c, CS_DESTROY);
 
         return 0;
       }
 
+      // RECV wait state timeout.
       if (c->state == CS_SYN_RECV &&
-          c->rdpSocket->mstime >= c->lastReceivePacketTime + RDP_WAIT_SYN_RECV) {
+          c->rdpSocket->mstime >=
+              c->lastReceivePacketTime + RDP_WAIT_SYN_RECV) {
         connStateSwitch(c, CS_DESTROY);
 
         return 0;
       }
 
       if (c->queue > 0) {
+        if (c->rdpSocket->mstime >=
+            c->lastResizeWindowTime + RDP_RESIZE_WINDOW_INTERVAL_MIN)
+          resizeWindow(c);
+
         // Packet retransmit.
         for (uint16_t i = c->seqnr - c->queue; i != c->seqnr; i++) {
           struct packetWrap *pw = rbufferGet(&c->outbuf, i);
 
+          // Stale packets reached retransmit timeout will be resent.
           if (pw == NULL || pw->transmissions == 0 || pw->needResend == 1 ||
               c->rdpSocket->mstime < pw->sentTime + c->retransmitTimeout)
             continue;
 
+          // Stale packets need to resend.
           pw->needResend = 1;
 
-          assert(c->flightWindow >= pw->payload);
           c->flightWindow -= pw->payload;
         }
-
-        resizeWindow(c);
 
         // Retransmitting.
         if (rdpConnFlushPackets(c) == -1) {
@@ -2159,7 +2145,8 @@ static int rdpConnCheck(rdpConn *c) {
     }
 
     if (c->state == CS_CONNECTED || c->state == CS_CONNECTED_FULL) {
-      if (c->rdpSocket->mstime >= c->lastSendPacketTime + RDP_KEEPALIVE_INTERVAL) {
+      if (c->rdpSocket->mstime >=
+          c->lastSendPacketTime + RDP_KEEPALIVE_INTERVAL) {
 
         rdpConnKeepAlive(c);
       }
@@ -2178,6 +2165,8 @@ static int rdpConnCheck(rdpConn *c) {
 
   assert(c->retransmitTicker - c->rdpSocket->mstime >= 0);
 
+  // nextCheckTimeout should be the smallest timeout value needed for next
+  // retransmit action, not bigger than the default value.
   c->rdpSocket->nextCheckTimeout =
       min(RDP_SOCKET_CHECK_TIMEOUT_MAX,
           max(RDP_SOCKET_CHECK_TIMEOUT_MIN,
@@ -2185,7 +2174,7 @@ static int rdpConnCheck(rdpConn *c) {
                   c->retransmitTicker - c->rdpSocket->mstime)));
 }
 
-// Should be invoked periodically, before sleep.
+// Should be invoked periodically, before program go into epoll_wait() sleep.
 // Return a timeout next time this function should be invoked again, in
 // milliseconds.
 int rdpSocketIntervalAction(rdpSocket *s) {
