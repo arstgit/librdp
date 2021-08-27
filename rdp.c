@@ -52,7 +52,7 @@
 #define RDP_RESIZE_WINDOW_INTERVAL_MIN 1000
 
 // See resizeWindow() implemention.
-#define RDP_WINDOW_SHRINK_FACTOR 2
+#define RDP_WINDOW_SHRINK_FACTOR 1.2
 #define RDP_WINDOW_EXPAND_FACTOR 2
 
 // Max rdpConns per rdpSocket.
