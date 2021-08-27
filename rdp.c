@@ -2037,6 +2037,11 @@ static inline void rdpConnKeepAlive(rdpConn *c) {
 }
 
 static inline int resizeWindow(rdpConn *c) {
+  if (c->rdpSocket->mstime <
+      c->lastResizeWindowTime + RDP_RESIZE_WINDOW_INTERVAL_MIN)
+    return 0;
+  c->lastResizeWindowTime = c->rdpSocket->mstime;
+
   // Shrink when no packets sent have acked, until the window can fit only one
   // packet.
   if (c->ackedBytesSinceResizeWindow == 0 &&
@@ -2114,9 +2119,7 @@ static inline int rdpConnCheck(rdpConn *c) {
       }
 
       if (c->queue > 0) {
-        if (c->rdpSocket->mstime >=
-            c->lastResizeWindowTime + RDP_RESIZE_WINDOW_INTERVAL_MIN)
-          resizeWindow(c);
+        resizeWindow(c);
 
         // Packet retransmit.
         for (uint16_t i = c->seqnr - c->queue; i != c->seqnr; i++) {
