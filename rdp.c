@@ -1531,8 +1531,8 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     }
 
     // receivedFin and eofseqnr are related fields.
-    if (!(*conn)->receivedFinCompleted && (*conn)->receivedFin &&
-        (*conn)->eofseqnr == (*conn)->acknr) {
+    if ((*conn)->eofseqnr == (*conn)->acknr && !(*conn)->receivedFinCompleted &&
+        (*conn)->receivedFin) {
       // Received all packets the other end sent.
       (*conn)->receivedFinCompleted = 1;
 
