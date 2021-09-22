@@ -1419,7 +1419,6 @@ int rdpConnClose(rdpConn *c) {
     connStateSwitch(c, CS_DESTROY);
     return 0;
   default:
-    dprintf(2, "state: %s", c->state);
     assert(0);
   }
 
@@ -2054,6 +2053,8 @@ static inline int resizeWindow(rdpConn *c) {
   } else {
     // Stay the same.
   }
+
+  tlog(c->rdpSocket, LL_DEBUG, "flightWindow: %d, flightWindowLimit: %d", c->flightWindow, c->flightWindowLimit);
 
   c->ackedBytesSinceResizeWindow = c->sentBytesSinceResizeWindow = 0;
 
