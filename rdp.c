@@ -55,6 +55,9 @@
 #define RDP_WINDOW_SHRINK_FACTOR 1.2
 #define RDP_WINDOW_EXPAND_FACTOR 2
 
+// Connection can transmit data freely without window resizing when it's first
+// established. In milliseconds.
+#define RDP_CONN_FREE_TRANSMIT_TIME (10 * 1000)
 // Max rdpConns per rdpSocket.
 #define RDP_MAX_CONNS_PER_RDPSOCKET 1024
 
@@ -815,7 +818,9 @@ int rdpConnInit(rdpConn *c, const struct sockaddr *addr, socklen_t addrlen,
 
   c->lastReceivePacketTime = c->rdpSocket->mstime;
 
-  c->lastResizeWindowTime = c->rdpSocket->mstime;
+  // Connection can transmit data freely without window resizing when it's first
+  // established.
+  c->lastResizeWindowTime = c->rdpSocket->mstime + RDP_CONN_FREE_TRANSMIT_TIME;
 
   // Attach this socket to context->rdpConns list.
   int n = dictAdd(c->rdpSocket->conns, c, NULL);
@@ -2054,7 +2059,8 @@ static inline int resizeWindow(rdpConn *c) {
     // Stay the same.
   }
 
-  tlog(c->rdpSocket, LL_DEBUG, "flightWindow: %d, flightWindowLimit: %d", c->flightWindow, c->flightWindowLimit);
+  tlog(c->rdpSocket, LL_DEBUG, "flightWindow: %d, flightWindowLimit: %d",
+       c->flightWindow, c->flightWindowLimit);
 
   c->ackedBytesSinceResizeWindow = c->sentBytesSinceResizeWindow = 0;
 
