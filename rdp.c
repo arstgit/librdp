@@ -2194,6 +2194,7 @@ int rdpSocketIntervalAction(rdpSocket *s) {
   s->mstime = mstime();
 
   if (s->mstime < s->lastCheck + s->nextCheckTimeout) {
+    // nextCheckTimeout could be lower than RDP_SOCKET_CHECK_TIMEOUT_MIN.
     return s->nextCheckTimeout - (s->mstime - s->lastCheck);
   }
 
