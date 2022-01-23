@@ -66,6 +66,9 @@
 #define RDP_RETRANSMIT_TIMEOUT_MAX 1000
 #define RDP_RETRANSMIT_TIMEOUT_DEFAULT 500
 
+// Packet max retransmit count. Disconnect if exceeded.
+#define RDP_RETRANSMIT_COUNT_MAX 20
+
 // Keep alive probes interval.
 #define RDP_KEEPALIVE_INTERVAL 29000
 
@@ -93,7 +96,8 @@
 // #define UDP_IPV4_MTU                                                           \
   (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE -       \
    PPPOE_HEADER_SIZE - MPPE_HEADER_SIZE - FUDGE_HEADER_SIZE)
-#define UDP_IPV4_MTU (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - PPPOE_HEADER_SIZE)
+#define UDP_IPV4_MTU                                                           \
+  (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - PPPOE_HEADER_SIZE)
 #define UDP_IPV6_MTU                                                           \
   (ETHERNET_MTU - IPV6_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE -       \
    PPPOE_HEADER_SIZE - MPPE_HEADER_SIZE - FUDGE_HEADER_SIZE)
@@ -193,7 +197,7 @@ struct __attribute__((packed)) packetWithSAck {
 struct packetWrap {
   size_t payload;    // Payload size does't include packet header size.
   uint64_t sentTime; // In microseconds.
-  uint32_t transmissions : 31;
+  uint32_t transmissions : 31; // Transmit count.
   uint32_t needResend : 1;
   unsigned char data[1]; // Packet bytes.
 };
@@ -1037,7 +1041,9 @@ static inline ssize_t sendAck(rdpConn *c) {
     int sackByteSize =
         c->outOfOrderCnt / 8 + 1 + 3 - ((c->outOfOrderCnt / 8 + 1 + 3) % 4);
 
+    // May incur ip fragmented.
     packetLen = getPacketWithSAckHeaderSize() - 1 + sackByteSize;
+
     p = (struct packet *)malloc(packetLen);
     assert(p);
     struct packetWithSAck *ps = (struct packetWithSAck *)p;
@@ -1529,6 +1535,12 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
   // based on the connection acknr. Drain it if there is.
   while (e = dictIteratorNext(s->connsIter)) {
     *conn = (rdpConn *)dictKeyGet(e);
+
+    if ((*conn)->state == CS_RESET) {
+      // Retransmit count exceeded is the only situation.
+      *events = RDP_CONN_ERROR;
+      return -1;
+    }
 
     if ((*conn)->state != CS_CONNECTED && (*conn)->state != CS_CONNECTED_FULL) {
       continue;
@@ -2126,6 +2138,17 @@ static inline int rdpConnCheck(rdpConn *c) {
       }
 
       if (c->queue > 0) {
+        // Connection timeout. No way to notify user directly. User should close
+        // this connection after rdpReadPoll() return a RDP_CONN_ERROR.
+        if (((struct packetWrap *)rbufferGet(&c->outbuf, c->seqnr - c->queue))
+                ->transmissions > RDP_RETRANSMIT_COUNT_MAX) {
+          // Can't switch to CS_DESTROY directly, no way to notify user they may
+          // holding a freed connection handle c.
+          connStateSwitch(c, CS_RESET);
+
+          return 0;
+        }
+
         resizeWindow(c);
 
         // Packet retransmit.
