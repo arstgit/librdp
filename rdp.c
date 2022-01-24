@@ -66,15 +66,15 @@
 #define RDP_RETRANSMIT_TIMEOUT_MAX 1000
 #define RDP_RETRANSMIT_TIMEOUT_DEFAULT 500
 
-// Packet max retransmit count. Disconnect if exceeded.
-#define RDP_RETRANSMIT_COUNT_MAX 20
-
 // Keep alive probes interval.
 #define RDP_KEEPALIVE_INTERVAL 29000
 
 // rdpConn can wait up to seconds in these states.
-#define RDP_WAIT_SYN_RECV 10000
-#define RDP_WAIT_FIN_SENT 10000
+#define RDP_WAIT_SYN_RECV (20 * 1000)
+#define RDP_WAIT_FIN_SENT (10 * 1000)
+
+// Packet max retransmit count. Disconnect if exceeded.
+#define RDP_RETRANSMIT_COUNT_MAX 100
 
 // Limits of vec number.
 #define RDP_MAX_VEC 1024
