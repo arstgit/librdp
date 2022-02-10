@@ -1307,6 +1307,7 @@ static inline ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec,
   case CS_SYN_RECV:
   case CS_DESTROY:
   case CS_FIN_SENT:
+  case CS_RESET:
 
     tlog(c->rdpSocket, LL_DEBUG, "connection not expceted state: %s",
          connStateNames[c->state]);
