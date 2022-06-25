@@ -980,6 +980,8 @@ static inline int sixteenAfter(uint16_t a, uint16_t b) {
 static inline int rdpConnFlightWindowFull(rdpConn *c) {
   if (c->flightWindow + (uint32_t)getMaxPacketPayloadSize() >
       (uint32_t)min(c->flightWindowLimit, c->recvWindowPeer)) {
+    tlog(c->rdpSocket, LL_DEBUG, "flightWindowLimit: ", c->flightWindowLimit);
+
     return 1;
   }
 
