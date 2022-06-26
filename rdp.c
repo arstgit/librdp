@@ -54,6 +54,10 @@
 // See resizeWindow() implemention.
 #define RDP_WINDOW_SHRINK_FACTOR 1.2
 #define RDP_WINDOW_EXPAND_FACTOR 2
+#define RDP_WINDOW_EXPAND_FAST_FACTOR 64
+
+// Threshold between window expand and fast expand.
+#define RDP_WINDOW_EXPAND_THRESHOLD (1 * 1024 * 1024)
 
 // Connection can transmit data freely without window resizing when it's first
 // established. In milliseconds.
@@ -2066,8 +2070,14 @@ static inline int resizeWindow(rdpConn *c) {
     c->flightWindowLimit =
         limitedWindow(c->flightWindow / RDP_WINDOW_SHRINK_FACTOR);
   } else if (c->ackedBytesSinceResizeWindow > 0) {
-    c->flightWindowLimit =
-        limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FACTOR);
+      if (c->flightWindowLimit < RDP_WINDOW_EXPAND_THRESHOLD) {
+        c->flightWindowLimit =
+            limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FAST_FACTOR);
+      } else {
+        c->flightWindowLimit =
+            limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FACTOR);
+        }
+
   } else {
     // Stay the same.
   }
