@@ -47,9 +47,9 @@
 #define RDP_WINDOW_SIZE_DEFAULT (RDP_BUFFER_SIZE_MAX / 4)
 
 // Minium Interval between resize flight window. In milliseconds.
-// Don't need the maxinum part because resize is triggered by packets arrival.
-// It's no need to resize if no packets.
-#define RDP_RESIZE_WINDOW_INTERVAL_MIN 1000
+// Interval max doesn't exist, cause resize is triggered by packets arrival.
+// No need to resize if there is no packets.
+#define RDP_RESIZE_WINDOW_INTERVAL_MIN 100
 
 // See resizeWindow() implemention.
 #define RDP_WINDOW_SHRINK_FACTOR 1.2
@@ -2150,6 +2150,7 @@ static inline int rdpConnCheck(rdpConn *c) {
           return 0;
         }
 
+        // When do resize ?
         resizeWindow(c);
 
         // Packet retransmit.
