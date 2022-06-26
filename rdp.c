@@ -44,7 +44,7 @@
 
 // Window size.
 #define RDP_WINDOW_SIZE_MAX RDP_BUFFER_SIZE_MAX
-#define RDP_WINDOW_SIZE_DEFAULT (RDP_BUFFER_SIZE_MAX / 4)
+#define RDP_WINDOW_SIZE_DEFAULT (RDP_BUFFER_SIZE_MAX / 8)
 
 // Minium Interval between resize flight window. In milliseconds.
 // Interval max doesn't exist, cause resize is triggered by packets arrival.
@@ -53,11 +53,11 @@
 
 // See resizeWindow() implemention.
 #define RDP_WINDOW_SHRINK_FACTOR 1.2
-#define RDP_WINDOW_EXPAND_FACTOR 2
-#define RDP_WINDOW_EXPAND_FAST_FACTOR 64
+#define RDP_WINDOW_EXPAND_FACTOR 1.2
+#define RDP_WINDOW_EXPAND_FAST_FACTOR 2
 
 // Threshold between window expand and fast expand.
-#define RDP_WINDOW_EXPAND_THRESHOLD (1 * 1024 * 1024)
+#define RDP_WINDOW_EXPAND_THRESHOLD RDP_WINDOW_SIZE_DEFAULT
 
 // Connection can transmit data freely without window resizing when it's first
 // established. In milliseconds.
