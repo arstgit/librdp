@@ -44,17 +44,15 @@
 
 // Window size.
 #define RDP_WINDOW_SIZE_MAX RDP_BUFFER_SIZE_MAX
-#define RDP_WINDOW_SIZE_DEFAULT (RDP_BUFFER_SIZE_MAX / 8)
-
-// Minium Interval between resize flight window. In milliseconds.
-// Interval max doesn't exist, cause resize is triggered by packets arrival.
-// No need to resize if there is no packets.
-#define RDP_RESIZE_WINDOW_INTERVAL_MIN 100
+#define RDP_WINDOW_SIZE_DEFAULT (2 * 1024 * 1024)
 
 // See resizeWindow() implemention.
-#define RDP_WINDOW_SHRINK_FACTOR 1.2
+#define RDP_WINDOW_SHRINK_FACTOR 1.5
 #define RDP_WINDOW_EXPAND_FACTOR 1.2
 #define RDP_WINDOW_EXPAND_FAST_FACTOR 2
+
+#define RDP_TARGET_LOSS_RATE_DEFAULT (10 * 1000)
+#define RDP_LOSS_RATE_VAR (2 * 1000)
 
 // Threshold between window expand and fast expand.
 #define RDP_WINDOW_EXPAND_THRESHOLD RDP_WINDOW_SIZE_DEFAULT
@@ -202,7 +200,7 @@ struct packetWrap {
   size_t payload;    // Payload size does't include packet header size.
   uint64_t sentTime; // In microseconds.
   uint32_t transmissions : 31; // Transmit count.
-  uint32_t needResend : 1;
+  uint32_t outOfFlightWindow : 1; // Need retransmit.
   unsigned char data[1]; // Packet bytes.
 };
 
@@ -248,9 +246,13 @@ struct rdpConn {
   uint32_t recvWindowPeer; // This is the window size we received from packets
                            // the other end sent.
   uint32_t recvWindowSelf; // This is our receive window.
+
+  // Calculate loss rate when resizing window.
   uint32_t lastResizeWindowTime;
-  uint32_t sentBytesSinceResizeWindow;
-  uint32_t ackedBytesSinceResizeWindow;
+  uint32_t targetLossRate; 
+  uint16_t ackedPacketNrSinceLastResize; 
+  uint16_t transmitedPacketNrOfAckedSinceLastResize; 
+  uint8_t needExpandWindow : 1;
 
   uint16_t idSeed;
   // On the connection initial end, sendId = recvId + 1, the other end, sendId =
@@ -847,6 +849,8 @@ rdpConn *rdpConnCreate(rdpSocket *s) {
   if (c == NULL) {
     return NULL;
   }
+  memset(c, 0, sizeof(*c));
+
   c->rdpSocket = s;
   c->userData = NULL;
   connStateInit(c);
@@ -871,8 +875,9 @@ rdpConn *rdpConnCreate(rdpSocket *s) {
   c->recvWindowPeer = limitedWindow(RDP_WINDOW_SIZE_MAX);
   c->recvWindowSelf = limitedWindow(RDP_WINDOW_SIZE_MAX);
   c->lastResizeWindowTime = 0;
-  c->sentBytesSinceResizeWindow = 0;
-  c->ackedBytesSinceResizeWindow = 0;
+  c->targetLossRate = RDP_TARGET_LOSS_RATE_DEFAULT;
+  c->ackedPacketNrSinceLastResize = 0;
+  c->transmitedPacketNrOfAckedSinceLastResize = 0;
   c->rtt = 0;
   c->rttVar = 0;
   c->nextRetransmitTimeout = boundedRetransmitTimeout(0);
@@ -907,13 +912,11 @@ static inline ssize_t sendData(rdpConn *c, unsigned char *buf, size_t len) {
 }
 
 static inline ssize_t sendPacketWrap(rdpConn *c, struct packetWrap *pw) {
-  assert(pw->transmissions == 0 || pw->needResend);
+  assert(pw->transmissions == 0 || pw->outOfFlightWindow);
 
   c->flightWindow += pw->payload;
 
-  c->sentBytesSinceResizeWindow += pw->payload;
-
-  pw->needResend = 0;
+  pw->outOfFlightWindow = 0;
 
   struct packet *p = (struct packet *)pw->data;
   p->acknr = c->acknr;
@@ -1018,13 +1021,16 @@ static inline int ackPacket(rdpConn *c, uint16_t i) {
   }
 
   // Resent packet didn't contribute to flightWindow.
-  if (!pw->needResend) {
+  // assert(!pw->outOfFlightWindow) may be true for now, because we resend them immediatly after setting outOfFlightWindow.
+  if (!pw->outOfFlightWindow) {
     assert(c->flightWindow >= pw->payload);
 
     c->flightWindow -= pw->payload;
   }
 
-  c->ackedBytesSinceResizeWindow += pw->payload;
+  c->ackedPacketNrSinceLastResize++;
+  c->transmitedPacketNrOfAckedSinceLastResize += pw->transmissions;
+  assert(c->ackedPacketNrSinceLastResize <= c->transmitedPacketNrOfAckedSinceLastResize);
 
   free(pw);
 
@@ -1177,7 +1183,7 @@ static inline int rdpConnFlushPackets(rdpConn *c) {
     struct packetWrap *pw = rbufferGet(&c->outbuf, i);
     // Fresh packets, and stale packets reached retransmit timeoout will be
     // sent.
-    if (pw == NULL || (pw->transmissions > 0 && pw->needResend == 0))
+    if (pw == NULL || (pw->transmissions > 0 && pw->outOfFlightWindow == 0))
       continue;
 
     if (rdpConnFlightWindowFull(c)) {
@@ -1231,7 +1237,7 @@ static inline void buildSendPacket(rdpConn *c, size_t payload, uint type,
       assert(pw);
       pw->payload = 0;
       pw->transmissions = 0;
-      pw->needResend = 0;
+      pw->outOfFlightWindow = 0;
 
       appendQueue = 1;
     }
@@ -1320,10 +1326,6 @@ static inline ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec,
     return -1;
   case CS_SYN_SENT:
   case CS_CONNECTED_FULL:
-
-    tlog(c->rdpSocket, LL_DEBUG, "connection EAGAIN, state: %s, id: %d",
-         connStateNames[c->state], c->recvId);
-
     errno = EAGAIN;
     return -1;
   case CS_CONNECTED:
@@ -1339,6 +1341,8 @@ static inline ssize_t rdpWriteVec(rdpConn *c, struct rdpVec *vec,
 
   if (rdpConnFlightWindowFull(c)) {
     connStateSwitch(c, CS_CONNECTED_FULL);
+
+    c->needExpandWindow = 1;
 
     errno = EAGAIN;
     return -1;
@@ -1456,6 +1460,7 @@ static inline int selectiveAck(rdpConn *c, uint32_t startSeqnr,
     if (!b)
       continue;
 
+    // can be deleted? duplicated with ackPacket()
     struct packetWrap *pw =
         (struct packetWrap *)rbufferGet(&c->outbuf, curSeqnr);
     if (!pw) {
@@ -2058,35 +2063,38 @@ static inline void rdpConnKeepAlive(rdpConn *c) {
 }
 
 static inline int resizeWindow(rdpConn *c) {
-  if (c->rdpSocket->mstime <
-      c->lastResizeWindowTime + RDP_RESIZE_WINDOW_INTERVAL_MIN)
+  if (!c->needExpandWindow && c->rdpSocket->mstime <
+      c->lastResizeWindowTime + 2 * c->rtt)
     return 0;
-  c->lastResizeWindowTime = c->rdpSocket->mstime;
 
-  // Shrink when no packets sent have acked, until the window can fit only one
-  // packet.
-  if (c->ackedBytesSinceResizeWindow == 0 &&
-      c->sentBytesSinceResizeWindow > 0) {
-    c->flightWindowLimit =
-        limitedWindow(c->flightWindow / RDP_WINDOW_SHRINK_FACTOR);
-  } else if (c->ackedBytesSinceResizeWindow > 0) {
-      if (c->flightWindowLimit < RDP_WINDOW_EXPAND_THRESHOLD) {
-        c->flightWindowLimit =
-            limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FAST_FACTOR);
-      } else {
-        c->flightWindowLimit =
-            limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FACTOR);
-        }
+  if (c->ackedPacketNrSinceLastResize == 0) return 0;
 
+  uint32_t lossRate = (c->transmitedPacketNrOfAckedSinceLastResize - c->ackedPacketNrSinceLastResize) * 100 * 1000 / c->transmitedPacketNrOfAckedSinceLastResize;
+
+  if (abs(lossRate - c->targetLossRate) <= RDP_LOSS_RATE_VAR) {
+    // stay the same
+  } else if (lossRate > c->targetLossRate) {
+	if (!c->needExpandWindow) {
+      c->flightWindowLimit =
+        limitedWindow(c->flightWindowLimit / RDP_WINDOW_SHRINK_FACTOR);
+	}
   } else {
-    // Stay the same.
+    if (c->flightWindowLimit <= RDP_WINDOW_EXPAND_THRESHOLD / RDP_WINDOW_EXPAND_FAST_FACTOR) {
+      c->flightWindowLimit =
+          limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FAST_FACTOR);
+    } else {
+      c->flightWindowLimit =
+          limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FACTOR);
+    }
   }
 
-  tlog(c->rdpSocket, LL_DEBUG, "flightWindow: %d, flightWindowLimit: %d",
-       c->flightWindow, c->flightWindowLimit);
+  tlog(c->rdpSocket, LL_DEBUG, "resizing window, lossRate: %d, flightWindow: %d, flightWindowLimit: %d, transmited: %d, acked: %d", lossRate,
+       c->flightWindow, c->flightWindowLimit, c->transmitedPacketNrOfAckedSinceLastResize, c->ackedPacketNrSinceLastResize);
 
-  c->ackedBytesSinceResizeWindow = c->sentBytesSinceResizeWindow = 0;
+  c->transmitedPacketNrOfAckedSinceLastResize = c->ackedPacketNrSinceLastResize = 0;
 
+  c->lastResizeWindowTime = c->rdpSocket->mstime;
+  c->needExpandWindow = 0;
   return 0;
 }
 
@@ -2160,7 +2168,7 @@ static inline int rdpConnCheck(rdpConn *c) {
           return 0;
         }
 
-        // When do resize ?
+        // queue > 0 means this connection is active and has a flight window.
         resizeWindow(c);
 
         // Packet retransmit.
@@ -2168,13 +2176,12 @@ static inline int rdpConnCheck(rdpConn *c) {
           struct packetWrap *pw = rbufferGet(&c->outbuf, i);
 
           // Stale packets reached retransmit timeout will be resent.
-          if (pw == NULL || pw->transmissions == 0 || pw->needResend == 1 ||
+          if (pw == NULL || pw->transmissions == 0 || pw->outOfFlightWindow == 1 ||
               c->rdpSocket->mstime < pw->sentTime + c->retransmitTimeout)
             continue;
 
-          // Stale packets need to resend.
-          pw->needResend = 1;
-
+          // Stale packets need to resend. Resend packet doesn't count for flightWindow
+          pw->outOfFlightWindow = 1;
           c->flightWindow -= pw->payload;
         }
 
