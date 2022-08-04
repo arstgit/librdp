@@ -199,9 +199,9 @@ struct __attribute__((packed)) packetWithSAck {
 struct packetWrap {
   size_t payload;    // Payload size does't include packet header size.
   uint64_t sentTime; // In microseconds.
-  uint32_t transmissions : 31; // Transmit count.
+  uint32_t transmissions : 31;    // Transmit count.
   uint32_t outOfFlightWindow : 1; // Need retransmit.
-  unsigned char data[1]; // Packet bytes.
+  unsigned char data[1];          // Packet bytes.
 };
 
 struct rdpSocket {
@@ -249,9 +249,9 @@ struct rdpConn {
 
   // Calculate loss rate when resizing window.
   uint32_t lastResizeWindowTime;
-  uint32_t targetLossRate; 
-  uint16_t ackedPacketNrSinceLastResize; 
-  uint16_t transmitedPacketNrOfAckedSinceLastResize; 
+  uint32_t targetLossRate;
+  uint16_t ackedPacketNrSinceLastResize;
+  uint16_t transmitedPacketNrOfAckedSinceLastResize;
   uint8_t needExpandWindow : 1;
 
   uint16_t idSeed;
@@ -1021,7 +1021,8 @@ static inline int ackPacket(rdpConn *c, uint16_t i) {
   }
 
   // Resent packet didn't contribute to flightWindow.
-  // assert(!pw->outOfFlightWindow) may be true for now, because we resend them immediatly after setting outOfFlightWindow.
+  // assert(!pw->outOfFlightWindow) may be true for now, because we resend them
+  // immediatly after setting outOfFlightWindow.
   if (!pw->outOfFlightWindow) {
     assert(c->flightWindow >= pw->payload);
 
@@ -1030,7 +1031,8 @@ static inline int ackPacket(rdpConn *c, uint16_t i) {
 
   c->ackedPacketNrSinceLastResize++;
   c->transmitedPacketNrOfAckedSinceLastResize += pw->transmissions;
-  assert(c->ackedPacketNrSinceLastResize <= c->transmitedPacketNrOfAckedSinceLastResize);
+  assert(c->ackedPacketNrSinceLastResize <=
+         c->transmitedPacketNrOfAckedSinceLastResize);
 
   free(pw);
 
@@ -1547,7 +1549,7 @@ ssize_t rdpReadPoll(rdpSocket *s, void *buf, size_t len, rdpConn **conn,
     *conn = (rdpConn *)dictKeyGet(e);
 
     if ((*conn)->state == CS_RESET) {
-      // Retransmit count exceeded is the only situation.
+      // It has to be etransmit count exceeded.
       *events = RDP_CONN_ERROR;
       return -1;
     }
@@ -2063,23 +2065,27 @@ static inline void rdpConnKeepAlive(rdpConn *c) {
 }
 
 static inline int resizeWindow(rdpConn *c) {
-  if (!c->needExpandWindow && c->rdpSocket->mstime <
-      c->lastResizeWindowTime + 2 * c->rtt)
+  if (!c->needExpandWindow &&
+      c->rdpSocket->mstime < c->lastResizeWindowTime + 2 * c->rtt)
     return 0;
 
-  if (c->ackedPacketNrSinceLastResize == 0) return 0;
+  if (c->ackedPacketNrSinceLastResize == 0)
+    return 0;
 
-  uint32_t lossRate = (c->transmitedPacketNrOfAckedSinceLastResize - c->ackedPacketNrSinceLastResize) * 100 * 1000 / c->transmitedPacketNrOfAckedSinceLastResize;
+  uint32_t lossRate = (c->transmitedPacketNrOfAckedSinceLastResize -
+                       c->ackedPacketNrSinceLastResize) *
+                      100 * 1000 / c->transmitedPacketNrOfAckedSinceLastResize;
 
   if (abs(lossRate - c->targetLossRate) <= RDP_LOSS_RATE_VAR) {
     // stay the same
   } else if (lossRate > c->targetLossRate) {
-	if (!c->needExpandWindow) {
+    if (!c->needExpandWindow) {
       c->flightWindowLimit =
-        limitedWindow(c->flightWindowLimit / RDP_WINDOW_SHRINK_FACTOR);
-	}
+          limitedWindow(c->flightWindowLimit / RDP_WINDOW_SHRINK_FACTOR);
+    }
   } else {
-    if (c->flightWindowLimit <= RDP_WINDOW_EXPAND_THRESHOLD / RDP_WINDOW_EXPAND_FAST_FACTOR) {
+    if (c->flightWindowLimit <=
+        RDP_WINDOW_EXPAND_THRESHOLD / RDP_WINDOW_EXPAND_FAST_FACTOR) {
       c->flightWindowLimit =
           limitedWindow(c->flightWindowLimit * RDP_WINDOW_EXPAND_FAST_FACTOR);
     } else {
@@ -2088,10 +2094,15 @@ static inline int resizeWindow(rdpConn *c) {
     }
   }
 
-  tlog(c->rdpSocket, LL_DEBUG, "resizing window, lossRate: %d, flightWindow: %d, flightWindowLimit: %d, transmited: %d, acked: %d", lossRate,
-       c->flightWindow, c->flightWindowLimit, c->transmitedPacketNrOfAckedSinceLastResize, c->ackedPacketNrSinceLastResize);
+  tlog(c->rdpSocket, LL_DEBUG,
+       "resizing window, lossRate: %d, flightWindow: %d, flightWindowLimit: "
+       "%d, transmited: %d, acked: %d",
+       lossRate, c->flightWindow, c->flightWindowLimit,
+       c->transmitedPacketNrOfAckedSinceLastResize,
+       c->ackedPacketNrSinceLastResize);
 
-  c->transmitedPacketNrOfAckedSinceLastResize = c->ackedPacketNrSinceLastResize = 0;
+  c->transmitedPacketNrOfAckedSinceLastResize =
+      c->ackedPacketNrSinceLastResize = 0;
 
   c->lastResizeWindowTime = c->rdpSocket->mstime;
   c->needExpandWindow = 0;
@@ -2157,13 +2168,18 @@ static inline int rdpConnCheck(rdpConn *c) {
       }
 
       if (c->queue > 0) {
-        // Connection timeout. No way to notify user directly. User should close
-        // this connection after rdpReadPoll() return a RDP_CONN_ERROR.
+        // Connection timeout.
+        // No way to notify user directly.
         if (((struct packetWrap *)rbufferGet(&c->outbuf, c->seqnr - c->queue))
                 ->transmissions > RDP_RETRANSMIT_COUNT_MAX) {
-          // Can't switch to CS_DESTROY directly, no way to notify user they may
-          // holding a freed connection handle c.
-          connStateSwitch(c, CS_RESET);
+          if (c->state == CS_FIN_SENT) {
+            // User has called rdpConnClosed() already.
+            connStateSwitch(c, CS_DESTROY);
+          } else {
+            // User should close this connection by rdpConnClosed() after
+            // rdpReadPoll() return a RDP_CONN_ERROR.
+            connStateSwitch(c, CS_RESET);
+          }
 
           return 0;
         }
@@ -2176,11 +2192,13 @@ static inline int rdpConnCheck(rdpConn *c) {
           struct packetWrap *pw = rbufferGet(&c->outbuf, i);
 
           // Stale packets reached retransmit timeout will be resent.
-          if (pw == NULL || pw->transmissions == 0 || pw->outOfFlightWindow == 1 ||
+          if (pw == NULL || pw->transmissions == 0 ||
+              pw->outOfFlightWindow == 1 ||
               c->rdpSocket->mstime < pw->sentTime + c->retransmitTimeout)
             continue;
 
-          // Stale packets need to resend. Resend packet doesn't count for flightWindow
+          // Stale packets need to resend. Resend packet doesn't count for
+          // flightWindow
           pw->outOfFlightWindow = 1;
           c->flightWindow -= pw->payload;
         }
