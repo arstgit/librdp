@@ -1031,8 +1031,15 @@ static inline int ackPacket(rdpConn *c, uint16_t i) {
 
   c->ackedPacketNrSinceLastResize++;
   c->transmitedPacketNrOfAckedSinceLastResize += pw->transmissions;
-  assert(c->ackedPacketNrSinceLastResize <=
-         c->transmitedPacketNrOfAckedSinceLastResize);
+  if (!(c->ackedPacketNrSinceLastResize <=
+        c->transmitedPacketNrOfAckedSinceLastResize)) {
+    tlog(c->rdpSocket, LL_DEBUG,
+         "ackedPacketNrSinceLastResize: %d, "
+         "transmitedPacketNrOfAckedSinceLastResize: %d, transmissions: %d",
+         c->ackedPacketNrSinceLastResize,
+         c->transmitedPacketNrOfAckedSinceLastResize, pw->transmissions);
+    assert(0);
+  }
 
   free(pw);
 
