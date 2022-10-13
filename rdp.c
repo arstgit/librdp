@@ -1038,6 +1038,7 @@ static inline int ackPacket(rdpConn *c, uint16_t i) {
          "transmitedPacketNrOfAckedSinceLastResize: %d, transmissions: %d",
          c->ackedPacketNrSinceLastResize,
          c->transmitedPacketNrOfAckedSinceLastResize, pw->transmissions);
+    // todo, error occured.
     assert(0);
   }
 
