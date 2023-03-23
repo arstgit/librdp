@@ -95,10 +95,10 @@
 #define PPPOE_HEADER_SIZE 8
 #define MPPE_HEADER_SIZE 2
 #define FUDGE_HEADER_SIZE 36
-// #define UDP_IPV4_MTU                                                           \
+#define UDP_IPV4_MTU                                                           \
   (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE -       \
    PPPOE_HEADER_SIZE - MPPE_HEADER_SIZE - FUDGE_HEADER_SIZE)
-#define UDP_IPV4_MTU                                                           \
+//#define UDP_IPV4_MTU                                                           \
   (ETHERNET_MTU - IPV4_HEADER_SIZE - UDP_HEADER_SIZE - PPPOE_HEADER_SIZE)
 #define UDP_IPV6_MTU                                                           \
   (ETHERNET_MTU - IPV6_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE -       \
